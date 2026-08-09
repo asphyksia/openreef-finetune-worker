@@ -1,0 +1,77 @@
+# OpenReef Fine-Tune Worker — AMD ROCm
+#
+# ROCm needs a stricter pin than CUDA: gfx variants, ROCm minor versions, and
+# bitsandbytes binaries differ across RDNA2/3/4 and pro cards. Strategy:
+#   1) Official ROCm+PyTorch base pin (never `:latest`)
+#   2) Axolotl pin + ROCm-capable bitsandbytes for clean imports
+#   3) Training path stays LoRA + adamw_torch (QLoRA is NVIDIA-only in worker)
+#   4) Build-time checks: HIP torch + axolotl + expected bnb ROCm .so
+#
+# Host-side gfx quirks (e.g. RDNA4 HSA_OVERRIDE_GFX_VERSION) stay in compose /
+# provider env — not baked into a multi-image matrix.
+
+ARG ROCM_PYTORCH_IMAGE=rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0
+ARG AXOLOTL_VERSION=0.17.0
+ARG BITSANDBYTES_VERSION=0.49.2
+ARG OGPU_VERSION=0.2.1
+
+FROM ${ROCM_PYTORCH_IMAGE}
+
+ARG AXOLOTL_VERSION
+ARG BITSANDBYTES_VERSION
+ARG OGPU_VERSION
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Install build dependencies (base image is system Python; --break-system-packages is required)
+RUN pip install --no-cache-dir --break-system-packages packaging setuptools wheel
+
+# Axolotl 0.17.0 pins bitsandbytes 0.49.1, which lacks libbitsandbytes_rocm72.so.
+# Force 0.49.2 so imports succeed on ROCm 7.2. Training still uses LoRA + adamw_torch;
+# QLoRA is not used on AMD in worker.py.
+RUN pip install --no-cache-dir --break-system-packages \
+    "axolotl==${AXOLOTL_VERSION}" \
+    s3fs fsspec && \
+    pip install --no-cache-dir --break-system-packages --no-deps --force-reinstall \
+    "bitsandbytes==${BITSANDBYTES_VERSION}"
+
+RUN pip install --no-cache-dir --break-system-packages "ogpu>=${OGPU_VERSION}"
+
+# Build-time sanity checks (no GPU required on the build host).
+RUN python - <<'PY'
+import importlib
+import pathlib
+import torch
+
+hip = getattr(torch.version, "hip", None)
+print("torch", torch.__version__, "hip", hip, "cuda", getattr(torch.version, "cuda", None))
+if not hip:
+    raise SystemExit(
+        "FATAL: torch.version.hip is None — this is not a ROCm PyTorch build. "
+        "Refuse to publish a CUDA/CPU torch as the AMD worker image."
+    )
+
+importlib.import_module("axolotl.cli.train")
+
+bnb_dir = pathlib.Path(importlib.import_module("bitsandbytes").__file__).parent
+expected = bnb_dir / "libbitsandbytes_rocm72.so"
+if not expected.exists():
+    found = sorted(p.name for p in bnb_dir.glob("libbitsandbytes_rocm*.so"))
+    raise SystemExit(
+        f"Missing expected ROCm 7.2 bitsandbytes binary: {expected.name}. "
+        f"Found: {found or 'none'}"
+    )
+print("runtime sanity OK: ROCm torch + axolotl + bitsandbytes rocm72")
+PY
+
+# Job I/O is bind-mounted at /workspace (/data on the provider host).
+# Keep application code outside that mount so provider volumes never shadow
+# the entrypoint (a previous bug wiped /workspace/worker.py at runtime).
+WORKDIR /workspace
+
+COPY worker.py runtime_probe.py training_config.py display_gpu_guard.py platform_compat.py /app/
+ENV PYTHONPATH=/app
+
+ENTRYPOINT ["python", "/app/worker.py"]

@@ -1,0 +1,89 @@
+# Fine-tune worker compose — NVIDIA CUDA
+# Fetched by provider nodes from the source ImageEnvironments URL.
+#
+# Services:
+# - openreef-signer: CPU-only; holds PROVIDER_PRIVATE_KEY; D2 claims
+# - finetune: GPU train; no private key; claims via signer
+#
+# Application code lives at /app in the image; /data→/workspace is job I/O only.
+#
+# Logging (Windows + Linux):
+# - docker logs <container>  (json-file driver)
+# - Host data dir (mapped to /data): logs/openreef_worker.log and OPENREEF_LOGS.txt
+#
+# GPU notes:
+# - Linux: NVIDIA Container Toolkit; `runtime: nvidia` + device reservations.
+# - Docker Desktop / WSL2: ensure GPU support is enabled; same compose usually works.
+
+services:
+  openreef-signer:
+    # Pin after green smoke: OPENREEF_SIGNER_IMAGE=ghcr.io/asphyksia/openreef-signer@sha256:…
+    image: ${OPENREEF_SIGNER_IMAGE:-ghcr.io/asphyksia/openreef-signer:latest}
+    pull_policy: always
+    restart: unless-stopped
+    # No host ports — only reachable on the compose network as openreef-signer:8787
+    environment:
+      - PROVIDER_PRIVATE_KEY=${PROVIDER_PRIVATE_KEY:-}
+      - OPENREEF_API_BASE=${OPENREEF_API_BASE:-https://openreef.network}
+      - OPENREEF_SIGNER_ALLOWED_API_BASES=${OPENREEF_SIGNER_ALLOWED_API_BASES:-https://openreef.network}
+      - OPENREEF_SIGNER_TOKEN=${OPENREEF_SIGNER_TOKEN:-}
+      - OPENREEF_CHAIN_ID=${OPENREEF_CHAIN_ID:-}
+      - OGPU_USE_TESTNET=${OGPU_USE_TESTNET:-}
+      - PYTHONUNBUFFERED=1
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+        labels: "openreef,signer"
+
+  finetune:
+    # Pin after green smoke: FINETUNE_IMAGE=ghcr.io/asphyksia/finetune-worker@sha256:…
+    image: ${FINETUNE_IMAGE:-ghcr.io/asphyksia/finetune-worker:cuda-latest}
+    pull_policy: always
+    depends_on:
+      - openreef-signer
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - /data:/workspace
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      - OPENREEF_PROVIDER_ENV=nvidia_cuda
+      - CALLBACK_URL=${CALLBACK_URL:-}
+      # Claim via external signer (PK stays on openreef-signer only).
+      - OPENREEF_SIGNER_URL=http://openreef-signer:8787
+      - OPENREEF_SIGNER_TOKEN=${OPENREEF_SIGNER_TOKEN:-}
+      # Fallback if claim payload omits api_base (public config normally includes it).
+      - OPENREEF_API_BASE=${OPENREEF_API_BASE:-https://openreef.network}
+      - OPENREEF_LOG_DIR=/workspace/logs
+      - PYTHONUNBUFFERED=1
+      - OPENREEF_HOST_OS=${OPENREEF_HOST_OS:-}
+      - OPENREEF_HOST_VIRT=${OPENREEF_HOST_VIRT:-}
+      - TORCH_DISABLE_NATIVE_JIT=${TORCH_DISABLE_NATIVE_JIT:-1}
+      - TORCHDYNAMO_DISABLE=${TORCHDYNAMO_DISABLE:-1}
+      - TORCH_COMPILE_DISABLE=${TORCH_COMPILE_DISABLE:-1}
+      - OPENREEF_FORCE_EAGER_TORCH=${OPENREEF_FORCE_EAGER_TORCH:-}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - ${PORT}:5555
+    command: ["--config", "/workspace/config.json"]
+    runtime: nvidia
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
+        labels: "openreef,finetune,nvidia"

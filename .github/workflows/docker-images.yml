@@ -1,0 +1,255 @@
+name: Build & Push finetune-worker
+
+# Public repo: standard hosted runners (fair use). Still cache aggressively.
+# SAFETY: default main push publishes only cuda-<sha> / rocm-<sha>.
+#         :cuda-latest / :rocm-latest require publish_latest=true (workflow_dispatch)
+#         or a future explicit policy flip after house smoke.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "Dockerfile.rocm"
+      - "worker.py"
+      - "runtime_probe.py"
+      - "training_config.py"
+      - "display_gpu_guard.py"
+      - "platform_compat.py"
+      - "pause_guard.py"
+      - "unsloth_train.py"
+      - "pins-cuda.env"
+      - ".github/workflows/docker-images.yml"
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - "Dockerfile.rocm"
+      - "worker.py"
+      - "runtime_probe.py"
+      - "training_config.py"
+      - "display_gpu_guard.py"
+      - "platform_compat.py"
+      - "pause_guard.py"
+      - "unsloth_train.py"
+      - "pins-cuda.env"
+      - ".github/workflows/docker-images.yml"
+  workflow_dispatch:
+    inputs:
+      build_cuda:
+        description: "Build NVIDIA CUDA image"
+        type: boolean
+        default: true
+      build_rocm:
+        description: "Build AMD ROCm image (expensive)"
+        type: boolean
+        default: false
+      publish_latest:
+        description: "Also tag :cuda-latest / :rocm-latest (only after smoke)"
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/finetune-worker
+
+concurrency:
+  group: docker-images-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      cuda: ${{ steps.flags.outputs.cuda }}
+      rocm: ${{ steps.flags.outputs.rocm }}
+      push: ${{ steps.flags.outputs.push }}
+      publish_latest: ${{ steps.flags.outputs.publish_latest }}
+    steps:
+      - uses: actions/checkout@v4
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+
+      - name: Path filter
+        id: filter
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            cuda_only:
+              - 'Dockerfile'
+              - 'pins-cuda.env'
+            rocm_only:
+              - 'Dockerfile.rocm'
+            shared:
+              - 'worker.py'
+              - 'runtime_probe.py'
+              - 'training_config.py'
+              - 'display_gpu_guard.py'
+              - 'platform_compat.py'
+              - 'pause_guard.py'
+              - 'unsloth_train.py'
+            workflow:
+              - '.github/workflows/docker-images.yml'
+
+      - name: Resolve flags
+        id: flags
+        run: |
+          set -euo pipefail
+          PUSH=false
+          PUBLISH_LATEST=false
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CUDA=true
+            ROCM=false
+            PUSH=false
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            CUDA="${{ inputs.build_cuda }}"
+            ROCM="${{ inputs.build_rocm }}"
+            PUSH=true
+            PUBLISH_LATEST="${{ inputs.publish_latest }}"
+          else
+            # push to main
+            CUDA=false
+            ROCM=false
+            PUSH=true
+            PUBLISH_LATEST=false
+            if [ "${{ steps.filter.outputs.cuda_only }}" = "true" ] \
+               || [ "${{ steps.filter.outputs.shared }}" = "true" ] \
+               || [ "${{ steps.filter.outputs.workflow }}" = "true" ]; then
+              CUDA=true
+            fi
+            if [ "${{ steps.filter.outputs.rocm_only }}" = "true" ] \
+               || [ "${{ steps.filter.outputs.shared }}" = "true" ] \
+               || [ "${{ steps.filter.outputs.workflow }}" = "true" ]; then
+              ROCM=true
+            fi
+            if [ "$CUDA" = "false" ] && [ "$ROCM" = "false" ]; then
+              CUDA=true
+            fi
+          fi
+          echo "cuda=$CUDA" >> "$GITHUB_OUTPUT"
+          echo "rocm=$ROCM" >> "$GITHUB_OUTPUT"
+          echo "push=$PUSH" >> "$GITHUB_OUTPUT"
+          echo "publish_latest=$PUBLISH_LATEST" >> "$GITHUB_OUTPUT"
+          echo "plan: cuda=$CUDA rocm=$ROCM push=$PUSH publish_latest=$PUBLISH_LATEST"
+
+  build-cuda:
+    needs: plan
+    if: needs.plan.outputs.cuda == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell
+          sudo docker image prune -af || true
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: needs.plan.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (CUDA)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=cuda-,format=short
+            type=sha,prefix=cuda-,format=long
+            type=raw,value=cuda-latest,enable=${{ needs.plan.outputs.publish_latest == 'true' }}
+
+      - name: Build CUDA
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: ${{ needs.plan.outputs.push == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: |
+            type=gha,scope=finetune-cuda
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cuda-buildcache
+          cache-to: |
+            type=gha,mode=max,scope=finetune-cuda
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cuda-buildcache,mode=max
+          provenance: false
+
+  build-rocm:
+    needs: plan
+    if: needs.plan.outputs.rocm == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: needs.plan.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (ROCm)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=rocm-,format=short
+            type=sha,prefix=rocm-,format=long
+            type=raw,value=rocm-latest,enable=${{ needs.plan.outputs.publish_latest == 'true' }}
+
+      - name: Build ROCm
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.rocm
+          push: ${{ needs.plan.outputs.push == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: |
+            type=gha,scope=finetune-rocm
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:rocm-buildcache
+          cache-to: |
+            type=gha,mode=min,scope=finetune-rocm
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:rocm-buildcache,mode=max
+          provenance: false
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pytest
+        run: pip install pytest
+      - name: Run worker contract tests
+        run: python -m pytest tests/ test_finetune_pause_guard.py -q --tb=short
