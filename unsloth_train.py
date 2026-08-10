@@ -182,10 +182,14 @@ def run_unsloth_sft(
         load_in_4bit=load_in_4bit,
         max_seq=max_seq,
     )
+    # ROCm RDNA4 (gfx1201): bf16 GEMMs page-fault in rocBLAS/Tensile
+    # (rocm-libraries#7992, open upstream). fp16 is the validated path on AMD;
+    # verified full 135-step train on RX 9060 XT (2026-08-10).
+    import torch as _torch
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=base_model,
         max_seq_length=max_seq,
-        dtype=None,
+        dtype=_torch.float16 if device == "amd_rocm" else None,
         load_in_4bit=load_in_4bit,
     )
     # Unsloth kernel path is optimized for lora_dropout=0 (see Unsloth LoRA guide).
@@ -222,7 +226,8 @@ def run_unsloth_sft(
         train_ds = split["train"]
         eval_ds = split["test"]
 
-    bf16 = is_bfloat16_supported()
+    # bf16 disabled on AMD: see rocm-libraries#7992 (RDNA4 Tensile page fault).
+    bf16 = is_bfloat16_supported() and device != "amd_rocm"
     # Logging file: redirect print/trainer via default logging
     if log_path is not None:
         log_path = Path(log_path)
