@@ -284,6 +284,8 @@ def build_runtime_report(expected_device: str | None = None) -> dict[str, Any]:
     nvidia_probe = _probe_nvidia_smi()
     rocm_probe = _probe_rocm()
     axolotl_probe = _probe_import("axolotl.cli.train")
+    # Unsloth dual-engine images do not ship Axolotl; either engine is valid.
+    unsloth_probe = _probe_import("unsloth")
     bnb_probe = _probe_import("bitsandbytes") if detected == "nvidia_cuda" or expected == "nvidia_cuda" else {
         "ok": None,
         "version": None,
@@ -303,8 +305,11 @@ def build_runtime_report(expected_device: str | None = None) -> dict[str, Any]:
         issues.append("NVIDIA CUDA selected but PyTorch is not a CUDA build")
     if detected in GPU_BACKENDS and not torch_probe["tensor_probe_ok"]:
         issues.append("GPU tensor probe failed")
-    if not axolotl_probe["ok"]:
-        issues.append(f"Axolotl import failed: {axolotl_probe['error']}")
+    if not axolotl_probe["ok"] and not unsloth_probe["ok"]:
+        issues.append(
+            "No train engine importable: "
+            f"axolotl={axolotl_probe.get('error')!r} unsloth={unsloth_probe.get('error')!r}"
+        )
     if (detected == "nvidia_cuda" or expected == "nvidia_cuda") and not bnb_probe["ok"]:
         issues.append(f"bitsandbytes import failed: {bnb_probe['error']}")
 
@@ -344,6 +349,7 @@ def build_runtime_report(expected_device: str | None = None) -> dict[str, Any]:
         "rocm": rocm_probe,
         "imports": {
             "axolotl": axolotl_probe,
+            "unsloth": unsloth_probe,
             "bitsandbytes": bnb_probe,
         },
         "issues": issues,

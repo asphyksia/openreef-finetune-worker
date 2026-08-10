@@ -72,45 +72,19 @@ def _load_jsonl_rows(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _example_to_text(example: dict[str, Any], tokenizer: Any) -> str:
-    """Build a single training string aligned with chat template when possible."""
-    messages = example.get("messages")
-    if isinstance(messages, list) and messages:
-        try:
-            return tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-        except Exception:
-            pass
+def _example_to_text(
+    example: dict[str, Any],
+    tokenizer: Any,
+    *,
+    sft_profile: str = "chat",
+) -> tuple[str, str]:
+    """Build training string via SFT contract v1. Returns (text, renderer_id)."""
+    from sft_format import normalize_messages, render_training_text
 
-    instruction = str(example.get("instruction") or "").strip()
-    input_text = str(example.get("input") or "").strip()
-    output = str(example.get("output") or "").strip()
-    if input_text and instruction:
-        user = f"{instruction}\n\n{input_text}"
-    else:
-        user = instruction or input_text
-    if not output:
-        return ""
-
-    if getattr(tokenizer, "chat_template", None):
-        try:
-            return tokenizer.apply_chat_template(
-                [
-                    {"role": "user", "content": user or "Continue."},
-                    {"role": "assistant", "content": output},
-                ],
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-        except Exception:
-            pass
-
-    if user:
-        return f"### Instruction:\n{user}\n\n### Response:\n{output}"
-    return output
+    messages = normalize_messages(example)
+    if not messages:
+        return "", "empty"
+    return render_training_text(messages, tokenizer, sft_profile=sft_profile)
 
 
 def run_unsloth_sft(
@@ -128,6 +102,8 @@ def run_unsloth_sft(
     num_dataset_rows: int | None = None,
     log_path: Path | None = None,
     phase: Callable[..., None] | None = None,
+    sft_profile: str = "chat",
+    serve_smoke: bool = True,
 ) -> Path:
     """Train with Unsloth and write PEFT adapter files under ``output_dir``.
 
@@ -207,16 +183,36 @@ def run_unsloth_sft(
     )
     _phase("unsloth_peft_ok", r=r, alpha=alpha, targets=len(targets))
 
+    profile = (sft_profile or "chat").strip().lower()
     rows = _load_jsonl_rows(Path(dataset_path))
     texts: list[str] = []
+    renderer_ids: list[str] = []
     for row in rows:
-        text = _example_to_text(row, tokenizer)
+        text, rid = _example_to_text(row, tokenizer, sft_profile=profile)
         if text and text.strip():
             texts.append(text)
+            renderer_ids.append(rid)
     if not texts:
         raise RuntimeError("No train strings after formatting dataset")
+    # Dominant renderer (should be uniform; mixed → experimental inconsistency)
+    from collections import Counter
+
+    renderer = Counter(renderer_ids).most_common(1)[0][0]
+    if profile == "chat" and renderer != "chat_template":
+        logger.warning(
+            "sft_profile=chat but renderer=%s (missing/broken chat_template?) — "
+            "smoke/eval must use the same renderer",
+            renderer,
+        )
     train_ds = Dataset.from_dict({"text": texts})
-    _phase("unsloth_dataset_ok", rows=len(texts), max_seq=max_seq)
+    _phase(
+        "unsloth_dataset_ok",
+        rows=len(texts),
+        max_seq=max_seq,
+        sft_profile=profile,
+        renderer=renderer,
+        has_chat_template=bool(getattr(tokenizer, "chat_template", None)),
+    )
 
     # val split only when enough rows (mirror Axolotl val_set_size gates)
     eval_ds = None
@@ -289,10 +285,128 @@ def run_unsloth_sft(
         except Exception:
             pass
 
-    trainer.train()
+    train_out = trainer.train()
+    train_loss = None
+    try:
+        metrics = getattr(train_out, "metrics", None) or {}
+        train_loss = metrics.get("train_loss")
+    except Exception:
+        train_loss = None
 
     # Save PEFT adapter + tokenizer next to what Axolotl would produce.
     model.save_pretrained(str(output_dir))
     tokenizer.save_pretrained(str(output_dir))
     _phase("unsloth_save_ok", output_dir=str(output_dir))
+
+    smoke_report: dict[str, Any] = {"enabled": bool(serve_smoke), "ok": True, "items": []}
+    if serve_smoke:
+        smoke_report = _run_serve_smoke(
+            model=model,
+            tokenizer=tokenizer,
+            rows=rows,
+            renderer=renderer,
+            phase=_phase,
+        )
+        if not smoke_report.get("ok"):
+            raise RuntimeError(
+                "SFT serve_smoke failed after train: "
+                + "; ".join(
+                    f"{it.get('reason')}" for it in smoke_report.get("items") or [] if not it.get("ok")
+                )
+            )
+
+    from sft_format import write_train_manifest
+
+    write_train_manifest(
+        output_dir / "openreef_train_manifest.json",
+        {
+            "schema": "openreef.sft_manifest.v1",
+            "base_model": base_model,
+            "sft_profile": profile,
+            "prompt_renderer": renderer,
+            "engine": "unsloth",
+            "device": device,
+            "adapter": adapter,
+            "preset": preset,
+            "lora_r": r,
+            "lora_alpha": alpha,
+            "max_seq_length": max_seq,
+            "num_train_rows": len(texts),
+            "train_loss": train_loss,
+            "dtype": "float16" if device == "amd_rocm" or not bf16 else "bfloat16",
+            "smoke": smoke_report,
+        },
+    )
+    _phase("unsloth_manifest_ok", renderer=renderer, smoke_ok=smoke_report.get("ok"))
     return output_dir
+
+
+def _run_serve_smoke(
+    *,
+    model: Any,
+    tokenizer: Any,
+    rows: list[dict[str, Any]],
+    renderer: str,
+    phase: Callable[..., None],
+) -> dict[str, Any]:
+    """Generate on a few train prompts with the same renderer; reject garbage."""
+    import torch
+    from sft_format import is_garbage_generation, pick_smoke_prompts, render_inference_prompt
+
+    pairs = pick_smoke_prompts(rows, n=3)
+    report: dict[str, Any] = {"enabled": True, "ok": True, "items": [], "renderer": renderer}
+    if not pairs:
+        report["ok"] = False
+        report["items"].append({"ok": False, "reason": "no_smoke_prompts"})
+        phase("serve_smoke_failed", reason="no_smoke_prompts")
+        return report
+
+    try:
+        from unsloth import FastLanguageModel
+
+        FastLanguageModel.for_inference(model)
+    except Exception:
+        pass
+
+    phase("serve_smoke_start", n=len(pairs), renderer=renderer)
+    for user, gold in pairs:
+        prompt = render_inference_prompt(user, tokenizer, renderer=renderer)
+        inputs = tokenizer(prompt, return_tensors="pt")
+        try:
+            device = next(model.parameters()).device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.inference_mode():
+                out = model.generate(
+                    **inputs,
+                    max_new_tokens=96,
+                    do_sample=False,
+                    pad_token_id=getattr(tokenizer, "eos_token_id", None)
+                    or getattr(tokenizer, "pad_token_id", None),
+                )
+            gen = tokenizer.decode(
+                out[0][inputs["input_ids"].shape[-1] :],
+                skip_special_tokens=True,
+            ).strip()
+        except Exception as exc:
+            report["ok"] = False
+            report["items"].append(
+                {"ok": False, "reason": f"generate_error:{type(exc).__name__}", "user": user[:80]}
+            )
+            continue
+        bad, reason = is_garbage_generation(gen)
+        item = {
+            "ok": not bad,
+            "reason": reason,
+            "user": user[:120],
+            "gold_preview": gold[:80],
+            "gen_preview": gen[:200],
+        }
+        if bad:
+            report["ok"] = False
+        report["items"].append(item)
+
+    if report["ok"]:
+        phase("serve_smoke_ok", n=len(report["items"]))
+    else:
+        phase("serve_smoke_failed", n=len(report["items"]))
+    return report

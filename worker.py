@@ -334,6 +334,8 @@ class FineTuneInput(BaseModel):
     val_set_size: float | None = None
     # auto | chat | alpaca — how to format SFT prompts (default auto)
     prompt_format: str | None = None
+    # SFT contract v1: chat | completion | experimental (see docs/sft-contract-v1.md)
+    sft_profile: str | None = None
     # Opaque claim (public on IPFS) — resolved via OpenReef claim API
     openreef: dict | None = None
 
@@ -772,10 +774,28 @@ def _resolved_prompt_format(job_input: FineTuneInput) -> str | None:
     return env or None
 
 
-def _select_train_engine(device: str) -> str:
-    """Pick Unsloth (NVIDIA primary) vs Axolotl (AMD + fallback).
+def _gpu_count() -> int:
+    """Visible accelerator count (CUDA/HIP via torch.cuda)."""
+    try:
+        import torch
 
-    OPENREEF_TRAIN_ENGINE=unsloth|axolotl|auto (default auto).
+        if torch.cuda.is_available():
+            return max(0, int(torch.cuda.device_count() or 0))
+    except Exception:
+        pass
+    env_n = (os.environ.get("OPENREEF_NUM_GPUS") or "").strip()
+    if env_n.isdigit():
+        return max(0, int(env_n))
+    return 0
+
+
+def _select_train_engine(device: str) -> str:
+    """Pick train engine (see docs/training-engine.md in monorepo).
+
+    Policy (auto):
+      - 1 GPU  → Unsloth when installed (default OpenReef path)
+      - ≥2 GPUs → Axolotl (multi-GPU / Accelerate niche)
+      - force OPENREEF_TRAIN_ENGINE=unsloth|axolotl
     """
     force = (os.environ.get("OPENREEF_TRAIN_ENGINE") or "auto").strip().lower()
     if force in ("unsloth", "axolotl"):
@@ -793,7 +813,14 @@ def _select_train_engine(device: str) -> str:
                 ) from exc
         return force
 
-    # auto: Unsloth is the single engine on both CUDA and ROCm images.
+    n_gpu = _gpu_count()
+    if n_gpu >= 2:
+        ogpu.service.logger.info(
+            "train_engine=auto → axolotl (multi-gpu n=%s device=%s)", n_gpu, device
+        )
+        return "axolotl"
+
+    # Single-GPU (or unknown count): Unsloth on CUDA and ROCm images.
     if device in ("nvidia_cuda", "amd_rocm"):
         try:
             from unsloth_train import unsloth_available
@@ -1770,6 +1797,11 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
                 for k, v in env.items():
                     if v is not None and k not in os.environ:
                         os.environ[k] = v
+                sft_profile = (
+                    (data.sft_profile or os.environ.get("OPENREEF_SFT_PROFILE") or "chat")
+                    .strip()
+                    .lower()
+                )
                 run_unsloth_sft(
                     base_model=data.base_model,
                     dataset_path=dataset_path,
@@ -1784,6 +1816,9 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
                     num_dataset_rows=num_rows,
                     log_path=log_path,
                     phase=_phase,
+                    sft_profile=sft_profile,
+                    serve_smoke=os.environ.get("OPENREEF_SERVE_SMOKE", "1").strip()
+                    not in ("0", "false", "no"),
                 )
                 train_s = round(time.monotonic() - train_t0, 1)
                 _phase("train_exit", code=0, seconds=train_s, engine="unsloth")
