@@ -100,8 +100,10 @@ jobs:
           PUSH=false
           PUBLISH_LATEST=false
           if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # Public repo = free minutes; build both so required checks
+            # (build-cuda/build-rocm) can go green and unblock the merge.
             CUDA=true
-            ROCM=false
+            ROCM=true
             PUSH=false
           elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             CUDA="${{ inputs.build_cuda }}"
