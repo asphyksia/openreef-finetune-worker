@@ -18,6 +18,7 @@ on:
       - "platform_compat.py"
       - "pause_guard.py"
       - "unsloth_train.py"
+      - "scripts/**"
       - "pins-cuda.env"
       - ".github/workflows/docker-images.yml"
   pull_request:
@@ -31,6 +32,7 @@ on:
       - "platform_compat.py"
       - "pause_guard.py"
       - "unsloth_train.py"
+      - "scripts/**"
       - "pins-cuda.env"
       - ".github/workflows/docker-images.yml"
   workflow_dispatch:
