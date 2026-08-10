@@ -67,6 +67,8 @@ jobs:
       rocm: ${{ steps.flags.outputs.rocm }}
       push: ${{ steps.flags.outputs.push }}
       publish_latest: ${{ steps.flags.outputs.publish_latest }}
+      cache_to_cuda: ${{ steps.flags.outputs.cache_to_cuda }}
+      cache_to_rocm: ${{ steps.flags.outputs.cache_to_rocm }}
     steps:
       - uses: actions/checkout@v4
         if: github.event_name == 'push' || github.event_name == 'pull_request'
@@ -130,6 +132,22 @@ jobs:
               CUDA=true
             fi
           fi
+          CACHE_CUDA="type=gha,mode=max,scope=finetune-cuda"
+          CACHE_ROCM="type=gha,mode=min,scope=finetune-rocm"
+          if [ "$PUSH" = "true" ]; then
+            CACHE_CUDA="$CACHE_CUDA
+          type=registry,ref=${REGISTRY:-ghcr.io}/${IMAGE_NAME:-asphyksia/finetune-worker}:cuda-buildcache,mode=max"
+            CACHE_ROCM="$CACHE_ROCM
+          type=registry,ref=${REGISTRY:-ghcr.io}/${IMAGE_NAME:-asphyksia/finetune-worker}:rocm-buildcache,mode=max"
+          fi
+          {
+            echo "cache_to_cuda<<EOFCACHE"
+            echo "$CACHE_CUDA"
+            echo "EOFCACHE"
+            echo "cache_to_rocm<<EOFCACHE"
+            echo "$CACHE_ROCM"
+            echo "EOFCACHE"
+          } >> "$GITHUB_OUTPUT"
           echo "cuda=$CUDA" >> "$GITHUB_OUTPUT"
           echo "rocm=$ROCM" >> "$GITHUB_OUTPUT"
           echo "push=$PUSH" >> "$GITHUB_OUTPUT"
@@ -183,9 +201,7 @@ jobs:
           cache-from: |
             type=gha,scope=finetune-cuda
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cuda-buildcache
-          cache-to: |
-            type=gha,mode=max,scope=finetune-cuda
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cuda-buildcache,mode=max
+          cache-to: ${{ needs.plan.outputs.cache_to_cuda }}
           provenance: false
 
   build-rocm:
@@ -240,9 +256,7 @@ jobs:
           cache-from: |
             type=gha,scope=finetune-rocm
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:rocm-buildcache
-          cache-to: |
-            type=gha,mode=min,scope=finetune-rocm
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:rocm-buildcache,mode=max
+          cache-to: ${{ needs.plan.outputs.cache_to_rocm }}
           provenance: false
 
   unit-tests:
