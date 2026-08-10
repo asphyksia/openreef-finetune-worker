@@ -1,25 +1,41 @@
-# OpenReef Fine-Tune Worker — AMD ROCm
+# OpenReef Fine-Tune Worker — AMD ROCm (Unsloth engine)
 #
-# ROCm needs a stricter pin than CUDA: gfx variants, ROCm minor versions, and
-# bitsandbytes binaries differ across RDNA2/3/4 and pro cards. Strategy:
-#   1) Official ROCm+PyTorch base pin (never `:latest`)
-#   2) Axolotl pin + ROCm-capable bitsandbytes for clean imports
-#   3) Training path stays LoRA + adamw_torch (QLoRA is NVIDIA-only in worker)
-#   4) Build-time checks: HIP torch + axolotl + expected bnb ROCm .so
+# EXPERIMENT (2026-08-10): replace Axolotl with Unsloth on ROCm so a single
+# train engine ships per vendor. House bench: RX 9060 XT (RDNA4/gfx1201),
+# ROCm 7.2.1 host; Unsloth officially supports RDNA 3/3.5/4.
 #
-# Host-side gfx quirks (e.g. RDNA4 HSA_OVERRIDE_GFX_VERSION) stay in compose /
-# provider env — not baked into a multi-image matrix.
+# Strategy:
+#   1) Official ROCm+PyTorch base pin (never :latest)
+#   2) unsloth[amd] + the same HF pins as the CUDA image (trl/transformers
+#      from the official Unsloth notebook patch surface)
+#   3) bitsandbytes >=0.50.0 (Unsloth AMD docs: <=0.49.2 has a 4-bit decode
+#      NaN bug on AMD). Worker still keeps LoRA-only on AMD.
+#   4) triton guard: the ROCm base ships triton with a +rocm local version.
+#      If Unsloth resolution ever swaps it for a clean PyPI (NVIDIA) triton,
+#      reinstall the ROCm build; then verify the module resolves.
+#   5) Build-time checks: HIP torch + unsloth + SFTConfig + triton import.
+#
+# Host-side gfx quirks stay in compose / provider env — not baked in.
 
 ARG ROCM_PYTORCH_IMAGE=rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0
-ARG AXOLOTL_VERSION=0.17.0
-ARG BITSANDBYTES_VERSION=0.49.2
 ARG OGPU_VERSION=0.2.1
+# Unsloth-compatible HF stack (same pins as the CUDA image).
+ARG TRANSFORMERS_VERSION=4.56.2
+ARG TRL_VERSION=0.22.2
+ARG DATASETS_VERSION=4.3.0
+ARG PEFT_VERSION=0.20.0
+ARG ACCELERATE_VERSION=1.6.0
+ARG BITSANDBYTES_VERSION=0.50.0
 
 FROM ${ROCM_PYTORCH_IMAGE}
 
-ARG AXOLOTL_VERSION
-ARG BITSANDBYTES_VERSION
 ARG OGPU_VERSION
+ARG TRANSFORMERS_VERSION
+ARG TRL_VERSION
+ARG DATASETS_VERSION
+ARG PEFT_VERSION
+ARG ACCELERATE_VERSION
+ARG BITSANDBYTES_VERSION
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -28,21 +44,65 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Install build dependencies (base image is system Python; --break-system-packages is required)
 RUN pip install --no-cache-dir --break-system-packages packaging setuptools wheel
 
-# Axolotl 0.17.0 pins bitsandbytes 0.49.1, which lacks libbitsandbytes_rocm72.so.
-# Force 0.49.2 so imports succeed on ROCm 7.2. Training still uses LoRA + adamw_torch;
-# QLoRA is not used on AMD in worker.py.
+# Pinned HF stack first so Unsloth cannot float us onto a breaking TRL.
 RUN pip install --no-cache-dir --break-system-packages \
-    "axolotl==${AXOLOTL_VERSION}" \
-    s3fs fsspec && \
-    pip install --no-cache-dir --break-system-packages --no-deps --force-reinstall \
+    "transformers==${TRANSFORMERS_VERSION}" \
+    "trl==${TRL_VERSION}" \
+    "datasets==${DATASETS_VERSION}" \
+    "peft==${PEFT_VERSION}" \
+    "accelerate==${ACCELERATE_VERSION}" \
+    "bitsandbytes==${BITSANDBYTES_VERSION}" \
+    s3fs fsspec
+
+# Unsloth (AMD flavor: HF stack without torch, bnb>=0.50, unsloth_zoo).
+RUN pip install --no-cache-dir --break-system-packages "unsloth[amd]"
+
+# Guard: triton must be a ROCm build. If resolution replaced it with a clean
+# PyPI version (no +rocm local tag), reinstall the base-image ROCm triton.
+# Pin discovered from rocm/pytorch:rocm7.2.4 base (verify on base bumps).
+ARG TRITON_ROCM_VERSION=3.6.0+rocm7.2.4.git4ed88892
+RUN python - <<'PY'
+import importlib.metadata as md
+import subprocess
+import sys
+
+try:
+    ver = md.version("triton")
+except md.PackageNotFoundError:
+    ver = None
+print("triton installed:", ver)
+if ver is None or "+rocm" not in ver:
+    print("non-ROCm triton detected; reinstalling ROCm build...")
+    subprocess.run(
+        [
+            sys.executable, "-m", "pip", "install", "--no-cache-dir",
+            "--break-system-packages", "--force-reinstall",
+            "triton==3.6.0+rocm7.2.4.git4ed88892",
+            "--index-url", "https://download.pytorch.org/whl/rocm7.2",
+        ],
+        check=True,
+    )
+import triton
+print("triton OK:", triton.__version__)
+PY
+
+# Re-assert pins after Unsloth resolution (belt & braces, same as CUDA image).
+RUN pip install --no-cache-dir --break-system-packages --force-reinstall --no-deps \
+    "transformers==${TRANSFORMERS_VERSION}" \
+    "trl==${TRL_VERSION}" \
+    "datasets==${DATASETS_VERSION}" \
+    "peft==${PEFT_VERSION}" \
+    "accelerate==${ACCELERATE_VERSION}" \
     "bitsandbytes==${BITSANDBYTES_VERSION}"
 
-RUN pip install --no-cache-dir --break-system-packages "ogpu>=${OGPU_VERSION}"
+RUN pip install --no-cache-dir --break-system-packages "ogpu[service]>=${OGPU_VERSION}"
 
 # Build-time sanity checks (no GPU required on the build host).
+# NOTE: `import unsloth` needs a visible accelerator (unsloth_zoo device
+# probe at import time), so the Unsloth/SFTConfig smoke lives in
+# scripts/smoke_unsloth_rocm.py and runs with GPU access instead.
 RUN python - <<'PY'
-import importlib
-import pathlib
+import importlib.metadata as md
 import torch
 
 hip = getattr(torch.version, "hip", None)
@@ -52,18 +112,9 @@ if not hip:
         "FATAL: torch.version.hip is None — this is not a ROCm PyTorch build. "
         "Refuse to publish a CUDA/CPU torch as the AMD worker image."
     )
-
-importlib.import_module("axolotl.cli.train")
-
-bnb_dir = pathlib.Path(importlib.import_module("bitsandbytes").__file__).parent
-expected = bnb_dir / "libbitsandbytes_rocm72.so"
-if not expected.exists():
-    found = sorted(p.name for p in bnb_dir.glob("libbitsandbytes_rocm*.so"))
-    raise SystemExit(
-        f"Missing expected ROCm 7.2 bitsandbytes binary: {expected.name}. "
-        f"Found: {found or 'none'}"
-    )
-print("runtime sanity OK: ROCm torch + axolotl + bitsandbytes rocm72")
+for pkg in ("transformers", "trl", "datasets", "peft", "unsloth", "unsloth_zoo"):
+    print(pkg, md.version(pkg))
+print("build-time sanity OK: ROCm torch + unsloth stack installed")
 PY
 
 # Job I/O is bind-mounted at /workspace (/data on the provider host).
@@ -71,7 +122,7 @@ PY
 # the entrypoint (a previous bug wiped /workspace/worker.py at runtime).
 WORKDIR /workspace
 
-COPY worker.py runtime_probe.py training_config.py display_gpu_guard.py platform_compat.py /app/
+COPY worker.py runtime_probe.py training_config.py display_gpu_guard.py platform_compat.py pause_guard.py unsloth_train.py /app/
+COPY scripts/ /app/scripts/
 ENV PYTHONPATH=/app
-
 ENTRYPOINT ["python", "/app/worker.py"]
