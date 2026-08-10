@@ -332,6 +332,8 @@ class FineTuneInput(BaseModel):
     lora_alpha: int | None = None
     sequence_len: int | None = None
     val_set_size: float | None = None
+    # auto | chat | alpaca — how to format SFT prompts (default auto)
+    prompt_format: str | None = None
     # Opaque claim (public on IPFS) — resolved via OpenReef claim API
     openreef: dict | None = None
 
@@ -505,29 +507,6 @@ def _download_dataset(url: str, target: Path, max_size_bytes: int = 500 * 1024 *
     return target
 
 
-def _messages_to_pair(messages: object) -> tuple[str, str] | None:
-    if not isinstance(messages, list):
-        return None
-
-    instruction = ""
-    output = ""
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        role = str(message.get("role", "")).lower()
-        content = message.get("content")
-        if not isinstance(content, str) or not content.strip():
-            continue
-        if role == "user":
-            instruction = content.strip()
-        elif role == "assistant":
-            output = content.strip()
-
-    if output:
-        return instruction, output
-    return None
-
-
 def _first_text_value(obj: dict, keys: tuple[str, ...]) -> str:
     for key in keys:
         value = obj.get(key)
@@ -536,28 +515,95 @@ def _first_text_value(obj: dict, keys: tuple[str, ...]) -> str:
     return ""
 
 
-def _extract_pair(obj: dict) -> tuple[str, str] | None:
-    messages_pair = _messages_to_pair(obj.get("messages"))
-    if messages_pair:
-        return messages_pair
+def _normalize_messages(messages: object) -> list[dict[str, str]] | None:
+    """Keep user/assistant(/system) turns with non-empty content; require assistant."""
+    if not isinstance(messages, list) or not messages:
+        return None
+    cleaned: list[dict[str, str]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", "")).strip().lower()
+        if role in ("human", "user", "prompter"):
+            role = "user"
+        elif role in ("gpt", "assistant", "bot", "model"):
+            role = "assistant"
+        elif role == "system":
+            role = "system"
+        else:
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        cleaned.append({"role": role, "content": content.strip()})
+    if not cleaned or cleaned[-1]["role"] != "assistant":
+        return None
+    if not any(m["role"] == "user" for m in cleaned):
+        return None
+    return cleaned
+
+
+def _user_content(instruction: str, input_text: str = "") -> str:
+    instruction = (instruction or "").strip()
+    input_text = (input_text or "").strip()
+    if instruction and input_text:
+        return f"{instruction}\n\n{input_text}"
+    return instruction or input_text
+
+
+def _extract_example(obj: dict) -> dict[str, object] | None:
+    """Build a dual-format training row: messages + Alpaca fields.
+
+    Instruct models train with Axolotl chat_template (messages).
+    Base models use structured Alpaca (instruction/input/output).
+    """
+    messages = _normalize_messages(obj.get("messages"))
+    if messages is not None:
+        instruction = ""
+        for m in messages:
+            if m["role"] == "user":
+                instruction = m["content"]
+        output = messages[-1]["content"]
+        return {
+            "messages": messages,
+            "instruction": instruction,
+            "input": "",
+            "output": output,
+        }
 
     output = _first_text_value(obj, ("output", "completion", "response", "answer"))
-    instruction = _first_text_value(obj, ("instruction", "prompt", "input", "question"))
-    if output:
-        return instruction, output
+    instruction = _first_text_value(obj, ("instruction", "prompt", "question"))
+    input_text = ""
+    raw_input = obj.get("input")
+    if isinstance(raw_input, str) and raw_input.strip():
+        if instruction:
+            input_text = raw_input.strip()
+        else:
+            instruction = raw_input.strip()
+    if not output:
+        text = obj.get("text")
+        if isinstance(text, str) and text.strip():
+            output = text.strip()
+            instruction = instruction or ""
+    if not output:
+        return None
 
-    text = obj.get("text")
-    if isinstance(text, str) and text.strip():
-        return "", text.strip()
+    user = _user_content(instruction, input_text)
+    if not user:
+        user = "Continue."
+    return {
+        "messages": [
+            {"role": "user", "content": user},
+            {"role": "assistant", "content": output},
+        ],
+        "instruction": instruction or user,
+        "input": input_text,
+        "output": output,
+    }
 
-    return None
 
-
-def _write_pair(out, instruction: str, output: str) -> None:
-    out.write(json.dumps(
-        {"instruction": instruction, "output": output},
-        ensure_ascii=False,
-    ) + "\n")
+def _write_example(out, example: dict[str, object]) -> None:
+    out.write(json.dumps(example, ensure_ascii=False) + "\n")
 
 
 def _normalise_jsonl(source: Path, target: Path) -> int:
@@ -570,12 +616,12 @@ def _normalise_jsonl(source: Path, target: Path) -> int:
             obj = json.loads(line)
             if not isinstance(obj, dict):
                 raise ValueError(f"Line {line_num}: expected a JSON object")
-            pair = _extract_pair(obj)
-            if pair is None:
+            example = _extract_example(obj)
+            if example is None:
                 raise ValueError(
                     f"Line {line_num}: expected instruction/output, prompt/completion, messages, or text"
                 )
-            _write_pair(out, *pair)
+            _write_example(out, example)
             count += 1
     return count
 
@@ -588,15 +634,22 @@ def _normalise_csv(source: Path, target: Path) -> int:
             raise ValueError("CSV has no header")
         fieldnames = {name.lower(): name for name in reader.fieldnames}
         output_name = next((fieldnames[k] for k in ("output", "completion", "response", "answer", "text") if k in fieldnames), None)
-        instruction_name = next((fieldnames[k] for k in ("instruction", "prompt", "input", "question") if k in fieldnames), None)
+        instruction_name = next((fieldnames[k] for k in ("instruction", "prompt", "question") if k in fieldnames), None)
+        input_name = fieldnames.get("input")
         if output_name is None:
             raise ValueError("CSV must include output, completion, response, answer, or text column")
         for row_num, row in enumerate(reader, start=2):
             output = (row.get(output_name) or "").strip()
             instruction = (row.get(instruction_name) or "").strip() if instruction_name else ""
+            input_text = (row.get(input_name) or "").strip() if input_name else ""
             if not output:
                 raise ValueError(f"Line {row_num}: output column is empty")
-            _write_pair(out, instruction, output)
+            example = _extract_example(
+                {"instruction": instruction, "input": input_text, "output": output}
+            )
+            if example is None:
+                raise ValueError(f"Line {row_num}: could not build training example")
+            _write_example(out, example)
             count += 1
     return count
 
@@ -608,7 +661,10 @@ def _normalise_txt(source: Path, target: Path) -> int:
             text = line.strip()
             if not text:
                 continue
-            _write_pair(out, "", text)
+            example = _extract_example({"text": text})
+            if example is None:
+                continue
+            _write_example(out, example)
             count += 1
     return count
 
@@ -663,6 +719,96 @@ def _detect_vram_gb() -> float | None:
     return None
 
 
+def _probe_tokenizer_has_chat_template(base_model: str) -> bool | None:
+    """Return True/False if tokenizer loads; None if probe fails (offline/gated).
+
+    Does not require a separate Hugging Face login for public models. Uses the
+    same HF token env vars providers already set for gated bases.
+    """
+    if not (base_model or "").strip():
+        return None
+    try:
+        from transformers import AutoTokenizer
+    except Exception as exc:
+        ogpu.service.logger.warning("tokenizer probe: transformers unavailable: %s", type(exc).__name__)
+        return None
+    token = (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        or None
+    )
+    try:
+        kwargs: dict = {
+            "trust_remote_code": True,
+            "use_fast": True,
+        }
+        if token:
+            kwargs["token"] = token
+        tok = AutoTokenizer.from_pretrained(base_model, **kwargs)
+        ct = getattr(tok, "chat_template", None)
+        has = bool(ct and str(ct).strip())
+        ogpu.service.logger.info(
+            "tokenizer probe: model=%s has_chat_template=%s",
+            base_model[:80],
+            has,
+        )
+        return has
+    except Exception as exc:
+        ogpu.service.logger.warning(
+            "tokenizer probe failed for %s: %s: %s",
+            base_model[:80],
+            type(exc).__name__,
+            str(exc)[:160],
+        )
+        return None
+
+
+def _resolved_prompt_format(job_input: FineTuneInput) -> str | None:
+    """Job field wins, then OPENREEF_PROMPT_FORMAT env, else auto."""
+    if job_input.prompt_format and str(job_input.prompt_format).strip():
+        return str(job_input.prompt_format).strip()
+    env = (os.environ.get("OPENREEF_PROMPT_FORMAT") or "").strip()
+    return env or None
+
+
+def _select_train_engine(device: str) -> str:
+    """Pick Unsloth (NVIDIA primary) vs Axolotl (AMD + fallback).
+
+    OPENREEF_TRAIN_ENGINE=unsloth|axolotl|auto (default auto).
+    """
+    force = (os.environ.get("OPENREEF_TRAIN_ENGINE") or "auto").strip().lower()
+    if force in ("unsloth", "axolotl"):
+        if force == "unsloth":
+            try:
+                from unsloth_train import unsloth_available
+
+                if not unsloth_available():
+                    raise RuntimeError(
+                        "OPENREEF_TRAIN_ENGINE=unsloth but unsloth is not installed"
+                    )
+            except ImportError as exc:
+                raise RuntimeError(
+                    "OPENREEF_TRAIN_ENGINE=unsloth but unsloth_train module missing"
+                ) from exc
+        return force
+
+    # auto: Unsloth is the single engine on both CUDA and ROCm images.
+    if device in ("nvidia_cuda", "amd_rocm"):
+        try:
+            from unsloth_train import unsloth_available
+
+            if unsloth_available():
+                return "unsloth"
+        except Exception:
+            pass
+        ogpu.service.logger.warning(
+            "Unsloth not available on %s image; falling back to Axolotl", device
+        )
+        return "axolotl"
+    return "axolotl"
+
+
 def _build_axolotl_config(
     job_input: FineTuneInput,
     config_dir: Path,
@@ -674,6 +820,9 @@ def _build_axolotl_config(
     Uses shared training_config (mirrored from backend) so local and OGPU
     paths share the same presets, batch clamps, and sequence length.
     QLoRA falls back to LoRA on AMD inside build_axolotl_config_dict.
+
+    Prompt format: tokenizer.chat_template (preferred) → name heuristic →
+    optional prompt_format force (job or OPENREEF_PROMPT_FORMAT).
     """
     device = _detect_device()
     adapter = job_input.adapter
@@ -685,6 +834,8 @@ def _build_axolotl_config(
         adapter = "lora"
 
     vram_gb = _detect_vram_gb()
+    prompt_format = _resolved_prompt_format(job_input)
+    has_chat_template = _probe_tokenizer_has_chat_template(job_input.base_model)
     config = build_axolotl_config_dict(
         base_model=job_input.base_model,
         dataset_path="/workspace/dataset.jsonl",
@@ -696,6 +847,8 @@ def _build_axolotl_config(
         dataset_prepared_path="/workspace/prepared",
         num_dataset_rows=num_dataset_rows,
         vram_gb=vram_gb,
+        prompt_format=prompt_format,
+        has_chat_template=has_chat_template,
     )
     # Optional *non-hardware* overrides from claim/backend.
     # Never apply sequence_len / batch / packing from the claim: claim hyperparams
@@ -716,11 +869,15 @@ def _build_axolotl_config(
             config.get("sequence_len"),
         )
 
+    prompt_reason = config.pop("_openreef_prompt_reason", None)
     config_path = config_dir / "axolotl.yml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=False, default_flow_style=False))
+    ds0 = (config.get("datasets") or [{}])[0]
+    ds_type = ds0.get("type")
     ogpu.service.logger.info(
         "Axolotl config: preset=%s device=%s adapter=%s seq=%s batch=%s packing=%s "
-        "rows=%s vram_gb=%s lora_r=%s val=%.2f gc=%s",
+        "rows=%s vram_gb=%s lora_r=%s val=%.2f gc=%s chat_template=%s dataset_type=%s "
+        "prompt_reason=%s has_chat_template=%s",
         job_input.preset,
         device,
         config.get("adapter"),
@@ -732,6 +889,16 @@ def _build_axolotl_config(
         config.get("lora_r"),
         float(config.get("val_set_size") or 0),
         config.get("gradient_checkpointing"),
+        config.get("chat_template"),
+        ds_type if isinstance(ds_type, str) else "alpaca_custom",
+        prompt_reason,
+        has_chat_template,
+    )
+    _phase(
+        "config_prompt",
+        reason=prompt_reason,
+        has_chat_template=has_chat_template,
+        chat_template=bool(config.get("chat_template")),
     )
     return str(config_path)
 
@@ -1419,7 +1586,9 @@ def _resolve_openreef_claim(data: FineTuneInput, task_address: str | None = None
 def finetune(data: FineTuneInput) -> FineTuneOutput:
     """Execute the fine-tuning job.
 
-    Automatically detects hardware and configures Axolotl accordingly.
+    Detects hardware and selects the train engine:
+    NVIDIA CUDA → Unsloth (primary); AMD ROCm → Unsloth (experiment).
+    Override with OPENREEF_TRAIN_ENGINE=unsloth|axolotl|auto.
     Returns the adapter as base64 (for small adapters) or uploads to R2
     and returns the output key.
     """
@@ -1532,36 +1701,10 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
         output_dir.mkdir(parents=True, exist_ok=True)
         _phase("workspace_reset", prepared_cleared=True, output_cleared=True, dataset_rows=num_rows)
 
-        # 2. Build Axolotl config (hardware-aware; packing gated by dataset size)
-        _phase("config_start", rows=num_rows, device=device)
-        ogpu.service.logger.info("Building Axolotl config for %s (rows=%s)...", device, num_rows)
-        config_path = _build_axolotl_config(data, work_dir, num_dataset_rows=num_rows)
-        # Re-read key knobs for the phase line (already logged in _build_axolotl_config).
-        try:
-            cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
-        except Exception:
-            cfg = {}
-        _phase(
-            "config_ok",
-            packing=cfg.get("sample_packing"),
-            seq=cfg.get("sequence_len"),
-            batch=cfg.get("micro_batch_size"),
-            optimizer=cfg.get("optimizer"),
-            epochs=cfg.get("num_epochs"),
-            bf16=cfg.get("bf16"),
-            fp16=cfg.get("fp16"),
-        )
-
-        # 3. Run Axolotl training
-        ogpu.service.logger.info("Running Axolotl training...")
         timeout_seconds = max(1800, min(int(data.timeout_seconds or 7200), 86400))
-        log_path = work_dir / "axolotl.log"
         env = os.environ.copy()
-        env["AXOLOTL_DO_NOT_TRACK"] = "1"
         env.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
         env.setdefault("WANDB_MODE", "disabled")
-        # Cross-platform train env (WSL2/Windows Docker Desktop, native Linux, …).
-        # Auto-disables fragile PyTorch 2.9 Triton native JIT on CUDA / WSL.
         from platform_compat import apply_train_compat_env, detect_container_host_context
 
         host_ctx = detect_container_host_context()
@@ -1577,18 +1720,7 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
             has_c_compiler=cc.get("has_c_compiler"),
             gcc=cc.get("gcc"),
         )
-        ogpu.service.logger.info(
-            "Host compat: family=%s wsl=%s docker_desktop=%s eager_torch=%s reason=%s has_c_compiler=%s",
-            host_ctx.get("host_family"),
-            host_ctx.get("is_wsl"),
-            host_ctx.get("is_docker_desktop"),
-            env.get("TORCH_DISABLE_NATIVE_JIT"),
-            env.get("OPENREEF_EAGER_TORCH_REASON"),
-            cc.get("has_c_compiler"),
-        )
 
-        # If this host also runs a desktop compositor on the same GPU, reserve VRAM.
-        # Headless provider containers: no DISPLAY → no cap (full card for training).
         from display_gpu_guard import (
             apply_guard_to_env,
             resolve_display_gpu_guard,
@@ -1604,88 +1736,164 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
                 fraction=guard.vram_fraction,
                 reason=guard.reason,
             )
-            ogpu.service.logger.info(
-                "Display GPU guard: protect=%s fraction=%s reason=%s",
-                guard.protect,
-                guard.vram_fraction,
-                guard.reason,
-            )
 
-        # Prefer single-process `python -m axolotl.cli.train` over `accelerate launch`.
-        # Accelerate re-raises CalledProcessError and hides the real child traceback
-        # in response IPFS (seen as ~530s fail with only the wrapper message).
-        training_python = env.get("OPENREEF_TRAINING_PYTHON") or "python"
-        if guard.enabled:
-            # Single-process train with hard VRAM ceiling (desktop-safe).
-            wrapper = write_vram_cap_wrapper(
-                work_dir,
-                training_python=training_python,
-                config_path=str(config_path),
-            )
-            train_cmd = [training_python, wrapper]
-        else:
-            train_cmd = [
-                training_python, "-m", "axolotl.cli.train",
-                str(config_path),
-            ]
+        train_engine = _select_train_engine(device)
+        _phase("train_engine", engine=train_engine, device=device)
+        log_path = work_dir / ("unsloth.log" if train_engine == "unsloth" else "axolotl.log")
+        train_s = 0.0
 
-        _phase(
-            "train_start",
-            cmd=" ".join(train_cmd),
-            timeout_s=timeout_seconds,
-            axolotl_log=str(log_path),
-        )
-        train_t0 = time.monotonic()
-        with log_path.open("w", encoding="utf-8") as train_log:
-            result = subprocess.run(
-                train_cmd,
-                stdout=train_log,
-                stderr=subprocess.STDOUT,
-                env=env,
-                timeout=timeout_seconds,
-            )
-        train_s = round(time.monotonic() - train_t0, 1)
-        _phase("train_exit", code=result.returncode, seconds=train_s)
+        if train_engine == "unsloth":
+            # In-process Unsloth SFT (NVIDIA). Writes PEFT files under /workspace/output.
+            _phase("config_start", rows=num_rows, device=device, engine="unsloth")
+            from unsloth_train import run_unsloth_sft
+            from training_config import resolve_training_hyperparams
 
-        if result.returncode != 0:
-            error_tail = _extract_training_error(log_path, max_chars=2500)
-            # Help providers correlate "missing c compiler" with our runtime image.
-            low = error_tail.lower()
-            if (
-                "c compiler" in low
-                or "compiler cannot be found" in low
-                or "unable to find a compatible compiler" in low
-                or ("triton" in low and "compile" in low)
-            ) and not cc.get("has_c_compiler"):
-                hint = (
-                    "HINT: image has no C compiler (CUDA runtime image by design). "
-                    "OpenReef sets lora_*_kernel=false so Axolotl must not use Triton "
-                    "LoRA/SwiGLU kernels. If you still see this: (1) pull latest "
-                    "finetune-worker:cuda-latest, (2) TORCH_DISABLE_NATIVE_JIT=1 only "
-                    "covers torch.compile — not Axolotl kernels, (3) do not force "
-                    "lora_mlp_kernel/lora_qkv_kernel true without installing gcc."
-                )
-                ogpu.service.logger.error("%s", hint)
-                error_tail = f"{error_tail}\n{hint}"
-            # Last lines of axolotl.log for Docker Desktop (full log is on disk).
-            try:
-                ax_tail = _read_text_tail(log_path, max_chars=1200)
-                if ax_tail.strip():
-                    _phase("train_log_tail", text=ax_tail.replace("\n", " | "))
-            except Exception:
-                pass
-            ogpu.service.logger.error("Training failed: %s", error_tail)
+            hp = resolve_training_hyperparams(
+                data.preset,
+                param_count=data.param_count,
+                device=device,
+                adapter=data.adapter,
+                num_dataset_rows=num_rows,
+            )
             _phase(
-                "train_failed",
-                code=result.returncode,
-                seconds=train_s,
-                error=(error_tail[:200] + "…") if len(error_tail) > 200 else error_tail,
+                "config_ok",
+                engine="unsloth",
+                seq=hp.get("sequence_len"),
+                batch=hp.get("micro_batch_size"),
+                epochs=hp.get("num_epochs"),
+                lora_r=data.lora_r or hp.get("lora_r"),
             )
-            # Prefer the *end* of the traceback (root exception line) when clipping.
-            if len(error_tail) > 2200:
-                error_tail = "…" + error_tail[-2199:]
-            _phase("job_failed", reason="train", total_s=round(time.monotonic() - job_t0, 1))
-            return _finish(FineTuneOutput(status="failed", error=error_tail, gpu_type=device))
+            _set_progress(phase="train_start", train_log=str(log_path))
+            train_t0 = time.monotonic()
+            try:
+                # Propagate env into process for HF token etc.
+                for k, v in env.items():
+                    if v is not None and k not in os.environ:
+                        os.environ[k] = v
+                run_unsloth_sft(
+                    base_model=data.base_model,
+                    dataset_path=dataset_path,
+                    output_dir=output_dir,
+                    preset=data.preset,
+                    adapter=data.adapter,
+                    device=device,
+                    param_count=data.param_count,
+                    lora_r=data.lora_r,
+                    lora_alpha=data.lora_alpha,
+                    max_seq_length=int(hp.get("sequence_len") or 2048),
+                    num_dataset_rows=num_rows,
+                    log_path=log_path,
+                    phase=_phase,
+                )
+                train_s = round(time.monotonic() - train_t0, 1)
+                _phase("train_exit", code=0, seconds=train_s, engine="unsloth")
+            except Exception as e:
+                train_s = round(time.monotonic() - train_t0, 1)
+                err = f"{type(e).__name__}: {e}"
+                ogpu.service.logger.exception("Unsloth training failed: %s", e)
+                try:
+                    if log_path.is_file():
+                        tail = _read_text_tail(log_path, max_chars=1200)
+                        if tail.strip():
+                            _phase("train_log_tail", text=tail.replace("\n", " | "))
+                except Exception:
+                    pass
+                _phase("train_failed", code=1, seconds=train_s, engine="unsloth", error=err[:200])
+                _phase("job_failed", reason="train", total_s=round(time.monotonic() - job_t0, 1))
+                return _finish(
+                    FineTuneOutput(status="failed", error=err[:2200], gpu_type=device)
+                )
+        else:
+            # Axolotl CLI path (AMD ROCm default, or OPENREEF_TRAIN_ENGINE=axolotl).
+            _phase("config_start", rows=num_rows, device=device, engine="axolotl")
+            ogpu.service.logger.info("Building Axolotl config for %s (rows=%s)...", device, num_rows)
+            config_path = _build_axolotl_config(data, work_dir, num_dataset_rows=num_rows)
+            try:
+                cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
+            except Exception:
+                cfg = {}
+            _phase(
+                "config_ok",
+                engine="axolotl",
+                packing=cfg.get("sample_packing"),
+                seq=cfg.get("sequence_len"),
+                batch=cfg.get("micro_batch_size"),
+                optimizer=cfg.get("optimizer"),
+                epochs=cfg.get("num_epochs"),
+                bf16=cfg.get("bf16"),
+                fp16=cfg.get("fp16"),
+            )
+
+            env["AXOLOTL_DO_NOT_TRACK"] = "1"
+            training_python = env.get("OPENREEF_TRAINING_PYTHON") or "python"
+            if guard.enabled:
+                wrapper = write_vram_cap_wrapper(
+                    work_dir,
+                    training_python=training_python,
+                    config_path=str(config_path),
+                )
+                train_cmd = [training_python, wrapper]
+            else:
+                train_cmd = [
+                    training_python, "-m", "axolotl.cli.train",
+                    str(config_path),
+                ]
+
+            _phase(
+                "train_start",
+                cmd=" ".join(train_cmd),
+                timeout_s=timeout_seconds,
+                axolotl_log=str(log_path),
+                engine="axolotl",
+            )
+            train_t0 = time.monotonic()
+            with log_path.open("w", encoding="utf-8") as train_log:
+                result = subprocess.run(
+                    train_cmd,
+                    stdout=train_log,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    timeout=timeout_seconds,
+                )
+            train_s = round(time.monotonic() - train_t0, 1)
+            _phase("train_exit", code=result.returncode, seconds=train_s, engine="axolotl")
+
+            if result.returncode != 0:
+                error_tail = _extract_training_error(log_path, max_chars=2500)
+                low = error_tail.lower()
+                if (
+                    "c compiler" in low
+                    or "compiler cannot be found" in low
+                    or "unable to find a compatible compiler" in low
+                    or ("triton" in low and "compile" in low)
+                ) and not cc.get("has_c_compiler"):
+                    hint = (
+                        "HINT: image has no C compiler (CUDA runtime image by design). "
+                        "OpenReef sets lora_*_kernel=false so Axolotl must not use Triton "
+                        "LoRA/SwiGLU kernels. If you still see this: (1) pull latest "
+                        "finetune-worker:cuda-latest, (2) TORCH_DISABLE_NATIVE_JIT=1 only "
+                        "covers torch.compile — not Axolotl kernels, (3) do not force "
+                        "lora_mlp_kernel/lora_qkv_kernel true without installing gcc."
+                    )
+                    ogpu.service.logger.error("%s", hint)
+                    error_tail = f"{error_tail}\n{hint}"
+                try:
+                    ax_tail = _read_text_tail(log_path, max_chars=1200)
+                    if ax_tail.strip():
+                        _phase("train_log_tail", text=ax_tail.replace("\n", " | "))
+                except Exception:
+                    pass
+                ogpu.service.logger.error("Training failed: %s", error_tail)
+                _phase(
+                    "train_failed",
+                    code=result.returncode,
+                    seconds=train_s,
+                    error=(error_tail[:200] + "…") if len(error_tail) > 200 else error_tail,
+                )
+                if len(error_tail) > 2200:
+                    error_tail = "…" + error_tail[-2199:]
+                _phase("job_failed", reason="train", total_s=round(time.monotonic() - job_t0, 1))
+                return _finish(FineTuneOutput(status="failed", error=error_tail, gpu_type=device))
 
         # 4. Find and return the adapter
         _phase("artifact_start")
