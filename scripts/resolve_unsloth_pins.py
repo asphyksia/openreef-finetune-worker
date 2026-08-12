@@ -35,6 +35,7 @@ from packaging.version import InvalidVersion, Version
 
 FINETUNE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = FINETUNE_DIR / "pins-cuda.env"
+DEFAULT_IO_OUT = FINETUNE_DIR / "requirements-worker-io.txt"
 
 # Platform line for OpenReef NVIDIA image (change rarely; not every Unsloth bump).
 DEFAULT_TORCH = "2.9.1"
@@ -106,7 +107,17 @@ def pypi_versions(pkg: str) -> list[str]:
 
 def base_requirement_specs(pkg: str, dep_name: str) -> SpecifierSet:
     """Union of unconditional requires_dist specs for dep_name from pkg metadata."""
-    data = pypi_info(pkg)
+    return requirement_specs(pypi_info(pkg), dep_name)
+
+
+def release_requirement_specs(pkg: str, version: str, dep_name: str) -> SpecifierSet:
+    """Return dependency constraints declared by one exact package release."""
+    data = _http_json(f"https://pypi.org/pypi/{pkg}/{version}/json")
+    return requirement_specs(data, dep_name)
+
+
+def requirement_specs(data: dict[str, Any], dep_name: str) -> SpecifierSet:
+    """Combine unconditional requires_dist constraints for one dependency."""
     specs = SpecifierSet()
     for raw in data.get("info", {}).get("requires_dist") or []:
         if not raw:
@@ -134,6 +145,31 @@ def base_requirement_specs(pkg: str, dep_name: str) -> SpecifierSet:
                 pass
         specs &= req.specifier
     return specs
+
+
+def resolve_io_requirements(datasets_version: str) -> dict[str, str]:
+    """Resolve a matching s3fs/fsspec pair accepted by the datasets lock."""
+    datasets_spec = release_requirement_specs("datasets", datasets_version, "fsspec")
+    if not datasets_spec:
+        raise RuntimeError(
+            f"datasets=={datasets_version} declares no fsspec constraint; refuse to float"
+        )
+
+    for s3fs_version in reversed(pypi_versions("s3fs")):
+        if Version(s3fs_version) not in datasets_spec:
+            continue
+        s3fs_spec = release_requirement_specs("s3fs", s3fs_version, "fsspec")
+        candidates = [
+            version
+            for version in pypi_versions("fsspec")
+            if Version(version) in datasets_spec and Version(version) in s3fs_spec
+        ]
+        if candidates:
+            return {"s3fs": s3fs_version, "fsspec": candidates[-1]}
+
+    raise RuntimeError(
+        f"No s3fs/fsspec pair satisfies datasets=={datasets_version} ({datasets_spec})"
+    )
 
 
 def max_in_spec(pkg: str, spec: SpecifierSet) -> str:
@@ -293,6 +329,16 @@ def render_env(pins: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
+def render_io_requirements(requirements: dict[str, str]) -> str:
+    lines = [
+        "# Shared worker I/O versions compatible with the pinned datasets release.",
+        "# Regenerated together with pins-cuda.env by resolve_unsloth_pins.py.",
+    ]
+    lines.extend(f"{name}=={version}" for name, version in requirements.items())
+    lines.append("")
+    return "\n".join(lines)
+
+
 def parse_env(path: Path) -> dict[str, str]:
     out: dict[str, str] = {}
     if not path.is_file():
@@ -311,6 +357,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--write", action="store_true", help=f"Write {DEFAULT_OUT}")
     ap.add_argument("--check", action="store_true", help="Exit 1 if pins-cuda.env is stale")
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    ap.add_argument("--io-out", type=Path, default=DEFAULT_IO_OUT)
     ap.add_argument("--unsloth-version", default=None, help="Pin specific unsloth (default: latest)")
     ap.add_argument("--torch-version", default=DEFAULT_TORCH)
     ap.add_argument("--cuda-channel", default=DEFAULT_CUDA_CHANNEL)
@@ -322,18 +369,26 @@ def main(argv: list[str] | None = None) -> int:
         cuda_channel=args.cuda_channel,
     )
     text = render_env(pins)
+    io_text = render_io_requirements(resolve_io_requirements(pins["DATASETS_VERSION"]))
 
     if args.check:
         current = args.out.read_text(encoding="utf-8") if args.out.is_file() else ""
-        if current.strip() != text.strip():
-            print("pins-cuda.env is stale; run resolve_unsloth_pins.py --write", file=sys.stderr)
+        current_io = (
+            args.io_out.read_text(encoding="utf-8") if args.io_out.is_file() else ""
+        )
+        if current.strip() != text.strip() or current_io.strip() != io_text.strip():
+            print(
+                "CUDA or worker I/O lock is stale; run resolve_unsloth_pins.py --write",
+                file=sys.stderr,
+            )
             return 1
-        print("pins-cuda.env is up to date")
+        print("CUDA and worker I/O locks are up to date")
         return 0
 
     if args.write:
         args.out.write_text(text, encoding="utf-8")
-        print(f"wrote {args.out}", file=sys.stderr)
+        args.io_out.write_text(io_text, encoding="utf-8")
+        print(f"wrote {args.out} and {args.io_out}", file=sys.stderr)
     else:
         sys.stdout.write(text)
     return 0

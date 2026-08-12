@@ -47,6 +47,28 @@ def test_direct_requirements_are_exactly_pinned():
     assert '"ogpu[service]==${OGPU_VERSION}"' in _read("Dockerfile")
 
 
+def test_worker_io_lock_matches_pinned_datasets_constraint():
+    io_pins = {}
+    for line in _read("requirements-worker-io.txt").splitlines():
+        if line and not line.startswith("#"):
+            name, version = line.split("==", 1)
+            io_pins[name] = version
+
+    cuda_pins = {}
+    for line in _read("pins-cuda.env").splitlines():
+        if line and not line.startswith("#") and "=" in line:
+            name, version = line.split("=", 1)
+            cuda_pins[name] = version
+
+    assert io_pins["s3fs"] == io_pins["fsspec"]
+    if cuda_pins["DATASETS_VERSION"] == "4.3.0":
+        assert io_pins["fsspec"] == "2025.9.0"
+
+    resolver = _read("scripts/resolve_unsloth_pins.py")
+    assert "resolve_io_requirements" in resolver
+    assert "DEFAULT_IO_OUT" in resolver
+
+
 def test_multigpu_compose_is_explicit_axolotl_opt_in():
     compose = yaml.safe_load(_read("docker-compose-nvidia-multigpu.yml"))
     finetune = compose["services"]["finetune"]

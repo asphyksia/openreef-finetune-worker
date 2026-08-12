@@ -1,3 +1,4 @@
-# Shared worker I/O versions present in the locally qualified GPU images.
-s3fs==2026.2.0
-fsspec==2026.2.0
+# Shared worker I/O versions compatible with the pinned datasets release.
+# Regenerated together with pins-cuda.env by resolve_unsloth_pins.py.
+s3fs==2025.9.0
+fsspec==2025.9.0
