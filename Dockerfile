@@ -47,9 +47,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
+COPY requirements-build.txt requirements-worker-io.txt /tmp/
 RUN python3.10 -m venv /opt/venv \
-    && pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir packaging setuptools wheel
+    && pip install --no-cache-dir -r /tmp/requirements-build.txt
 
 # CUDA torch from the official channel only — never the default PyPI resolver.
 RUN pip install --no-cache-dir \
@@ -69,8 +69,7 @@ RUN pip install --no-cache-dir \
     "peft==${PEFT_VERSION}" \
     "accelerate==${ACCELERATE_VERSION}" \
     "bitsandbytes==${BITSANDBYTES_VERSION}" \
-    s3fs \
-    fsspec \
+    -r /tmp/requirements-worker-io.txt \
     --extra-index-url "${TORCH_INDEX_URL}"
 
 # Unsloth + zoo at lock versions. Then re-assert pins only if deps drifted
@@ -170,7 +169,12 @@ except subprocess.CalledProcessError:
     print("pin guard: pip check reported issues (non-fatal if pins match)", flush=True)
 PY
 
-RUN pip install --no-cache-dir "ogpu[service]>=${OGPU_VERSION}"
+RUN pip install --no-cache-dir "ogpu[service]==${OGPU_VERSION}"
+
+COPY THIRD_PARTY_NOTICES.md /licenses/OPENREEF_THIRD_PARTY_NOTICES.md
+COPY scripts/write_dependency_inventory.py /tmp/write_dependency_inventory.py
+RUN python /tmp/write_dependency_inventory.py \
+    && rm -f /tmp/write_dependency_inventory.py
 
 # Reproducibility gate (no GPU required on the build host).
 # `import unsloth` needs a visible accelerator (unsloth_zoo device probe at

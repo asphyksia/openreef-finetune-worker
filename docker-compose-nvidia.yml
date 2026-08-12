@@ -20,7 +20,7 @@ services:
     # Pin after green smoke: OPENREEF_SIGNER_IMAGE=ghcr.io/asphyksia/openreef-signer@sha256:…
     image: ${OPENREEF_SIGNER_IMAGE:-ghcr.io/asphyksia/openreef-signer:latest}
     pull_policy: always
-    restart: unless-stopped
+    restart: on-failure:3
     # No host ports — only reachable on the compose network as openreef-signer:8787
     environment:
       - PROVIDER_PRIVATE_KEY=${PROVIDER_PRIVATE_KEY:-}
@@ -29,12 +29,16 @@ services:
       - OPENREEF_SIGNER_TOKEN=${OPENREEF_SIGNER_TOKEN:-}
       - OPENREEF_CHAIN_ID=${OPENREEF_CHAIN_ID:-}
       - OGPU_USE_TESTNET=${OGPU_USE_TESTNET:-}
+      - OPENREEF_UPDATE_FILE=/openreef-control/updating
+      - OPENREEF_PAUSE_FILE=/openreef-control/paused
       - PYTHONUNBUFFERED=1
     security_opt:
       - no-new-privileges:true
     read_only: true
     tmpfs:
       - /tmp
+    volumes:
+      - /data/openreef-control:/openreef-control:ro
     logging:
       driver: json-file
       options:
@@ -53,13 +57,17 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              # Default stays one GPU/Unsloth. Multi-GPU providers explicitly
+              # set OPENREEF_GPU_COUNT=all and pin the cuda-multigpu image.
+              count: ${OPENREEF_GPU_COUNT:-1}
               capabilities: [gpu]
     volumes:
       - /data:/workspace
     environment:
       - HF_TOKEN=${HF_TOKEN:-}
       - OPENREEF_PROVIDER_ENV=nvidia_cuda
+      - OPENREEF_TRAIN_ENGINE=${OPENREEF_TRAIN_ENGINE:-auto}
+      - OPENREEF_NUM_GPUS=${OPENREEF_NUM_GPUS:-}
       - CALLBACK_URL=${CALLBACK_URL:-}
       # Claim via external signer (PK stays on openreef-signer only).
       - OPENREEF_SIGNER_URL=http://openreef-signer:8787
@@ -67,6 +75,9 @@ services:
       # Fallback if claim payload omits api_base (public config normally includes it).
       - OPENREEF_API_BASE=${OPENREEF_API_BASE:-https://openreef.network}
       - OPENREEF_LOG_DIR=/workspace/logs
+      - OPENREEF_UPDATE_FILE=/workspace/openreef-control/updating
+      - OPENREEF_ACTIVE_FILE=/workspace/openreef-control/training.active
+      - OPENREEF_PAUSE_FILE=/workspace/openreef-control/paused
       - PYTHONUNBUFFERED=1
       - OPENREEF_HOST_OS=${OPENREEF_HOST_OS:-}
       - OPENREEF_HOST_VIRT=${OPENREEF_HOST_VIRT:-}
@@ -80,7 +91,7 @@ services:
       - ${PORT}:5555
     command: ["--config", "/workspace/config.json"]
     runtime: nvidia
-    restart: unless-stopped
+    restart: on-failure:3
     logging:
       driver: json-file
       options:

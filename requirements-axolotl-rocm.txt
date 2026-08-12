@@ -1,0 +1,4 @@
+# AMD training stack. bitsandbytes is separate because the Axolotl dependency
+# pin does not currently ship the required ROCm 7.2 binary.
+axolotl==0.17.0
+ogpu[service]==0.2.3

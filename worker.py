@@ -1,8 +1,9 @@
 """OGPU Source worker — runs inside the provider's container.
 
 Receives a fine-tuning task from OGPU, detects the available hardware
-(NVIDIA CUDA or AMD ROCm), runs Axolotl training with hardware-specific
-configuration, and returns the trained adapter via presigned PUT URL or base64.
+(NVIDIA CUDA or AMD ROCm), selects the product engine (single-GPU NVIDIA
+Unsloth; ROCm or multi-GPU Axolotl), and returns the trained adapter via
+presigned PUT URL or base64.
 
 Hardware detection is automatic — the same worker.py works on both
 NVIDIA and AMD providers without modification.
@@ -20,6 +21,7 @@ import sys
 import time
 import zipfile
 from pathlib import Path
+from typing import Any, Callable
 
 import ogpu.service
 import requests
@@ -33,7 +35,12 @@ from runtime_probe import (
     verify_runtime,
 )
 from training_config import build_axolotl_config_dict
-from pause_guard import provider_pause_reason
+from pause_guard import (
+    clear_training_active,
+    mark_training_active,
+    pause_file_path,
+    provider_pause_reason,
+)
 
 # Host-visible logs: provider-app bind-mounts host data dir → /data → /workspace.
 # Windows/Linux providers can open these files even when `docker logs` is empty.
@@ -49,6 +56,7 @@ _PROGRESS_STATE: dict[str, object] = {
     "step": None,
     "max_steps": None,
     "train_log": None,
+    "metrics": None,
 }
 
 # Floors mirror backend app.services.job_progress.PHASE_PROGRESS
@@ -68,6 +76,8 @@ _PHASE_PROGRESS_FLOOR: dict[str, int] = {
     "train_start": 50,
     "train": 50,
     "train_exit": 90,
+    "train_failed": 90,
+    "gpu_fault": 90,
     "artifact_start": 92,
     "upload_start": 95,
     "upload_ok": 97,
@@ -83,6 +93,8 @@ _PHASE_LABELS: dict[str, str] = {
     "train_start": "Training started",
     "train": "Training…",
     "train_exit": "Training finished",
+    "train_failed": "Training failed",
+    "gpu_fault": "GPU runtime fault — aborting",
     "artifact_start": "Packaging adapter…",
     "upload_start": "Uploading adapter…",
     "upload_ok": "Upload complete",
@@ -107,6 +119,7 @@ def _set_progress(
     step: int | None = None,
     max_steps: int | None = None,
     train_log: str | None = None,
+    metrics: dict[str, float] | None = None,
 ) -> None:
     with _progress_lock():
         if phase is not None:
@@ -130,6 +143,8 @@ def _set_progress(
             _PROGRESS_STATE["max_steps"] = int(max_steps)
         if train_log is not None:
             _PROGRESS_STATE["train_log"] = train_log
+        if metrics is not None:
+            _PROGRESS_STATE["metrics"] = dict(metrics)
         # Blend train steps into 50–90 when known
         st = _PROGRESS_STATE.get("step")
         ms = _PROGRESS_STATE.get("max_steps")
@@ -229,10 +244,28 @@ def _phase(name: str, **fields: object) -> None:
         detail = _PHASE_LABELS[name]
         if detail_bits:
             detail = f"{detail} ({', '.join(detail_bits)})"
+    metric_values: dict[str, float] | None = None
+    step = None
+    max_steps = None
+    if name == "train_metrics":
+        metric_values = {}
+        for key in ("loss", "eval_loss", "learning_rate", "grad_norm"):
+            value = fields.get(key)
+            if isinstance(value, (int, float)):
+                metric_values[key] = float(value)
+        step_value = fields.get("step")
+        max_steps_value = fields.get("max_steps")
+        if isinstance(step_value, int):
+            step = step_value
+        if isinstance(max_steps_value, int):
+            max_steps = max_steps_value
     _set_progress(
         phase=name,
         detail=detail,
+        step=step,
+        max_steps=max_steps,
         train_log=str(train_log) if train_log else None,
+        metrics=metric_values,
     )
 
 
@@ -332,6 +365,7 @@ class FineTuneInput(BaseModel):
     lora_alpha: int | None = None
     sequence_len: int | None = None
     val_set_size: float | None = None
+    custom_config: dict | None = None
     # auto | chat | alpaca — how to format SFT prompts (default auto)
     prompt_format: str | None = None
     # SFT contract v1: chat | completion | experimental (see docs/sft-contract-v1.md)
@@ -358,6 +392,93 @@ class FineTuneOutput(BaseModel):
     artifact_size_bytes: int | None = None
     gpu_type: str | None = None
     error: str | None = None
+    # Optional containment metadata for OpenReef backend (ignored by older harvest paths).
+    failure_class: str | None = None
+    retryable: bool | None = None
+    training_metrics: dict | None = None
+
+
+# GPU/runtime faults that thrash if requeued on the same node (esp. RDNA4/ROCm).
+_GPU_FAULT_MARKERS: tuple[str, ...] = (
+    "memory access fault",
+    "page not present",
+    "page not present or supervisor privilege",
+    "gpu coredump",
+    "hsa_status_error",
+    "hsa_status",
+    "rocm error",
+    "hip error out of memory",  # distinct from host OOM messaging; rare
+    "device-side assert",
+    "gpu_fault:",
+)
+
+_GPU_FAULT_PUBLIC = (
+    "gpu_fault: GPU runtime aborted training (memory page fault / ROCm crash). "
+    "This is a provider GPU/runtime fault, not a problem with your dataset. "
+    "The job will not blind-retry this fault class on the same attempt chain; "
+    "credits are refunded."
+)
+
+
+def classify_train_failure(
+    *,
+    error_text: str = "",
+    returncode: int | None = None,
+    device: str | None = None,
+) -> tuple[str, str, bool]:
+    """Classify a training abort for product containment.
+
+    Returns ``(failure_class, public_error, retryable)``.
+
+    ``gpu_fault`` is non-retryable for blind requeue: ROCm page-faults are
+    stochastic and re-running the same job on the same GPU thrice only burns
+    wall time and reputation. Other train errors stay ``retryable=True`` so
+    multi-provider fallback can still help.
+    """
+    text = (error_text or "").strip()
+    low = text.lower()
+    dev = (device or "").strip().lower()
+
+    marker_hit = any(m in low for m in _GPU_FAULT_MARKERS)
+    # SIGABRT (-6 / 128+6=134) and SIGSEGV (-11 / 139) on AMD after mid-train
+    # are almost always GPU runtime death even when the log tail is noisy.
+    fatal_rc = returncode in (-6, 134, -11, 139, 6) if returncode is not None else False
+    amd_like = dev.startswith("amd") or "rocm" in dev
+    if marker_hit or (fatal_rc and amd_like):
+        return "gpu_fault", _GPU_FAULT_PUBLIC, False
+
+    if not text:
+        if returncode is not None and returncode != 0:
+            return (
+                "train_error",
+                f"Training process exited with code {returncode} without producing an adapter.",
+                True,
+            )
+        return "train_error", "Training failed without producing an adapter.", True
+
+    # Keep a readable public error; full diagnostics stay in docker logs / PHASE=.
+    public = text if len(text) <= 2200 else ("…" + text[-2199:])
+    return "train_error", public, True
+
+
+def _failed_train_output(
+    *,
+    error_text: str = "",
+    returncode: int | None = None,
+    device: str | None = None,
+) -> "FineTuneOutput":
+    failure_class, public_error, retryable = classify_train_failure(
+        error_text=error_text,
+        returncode=returncode,
+        device=device,
+    )
+    return FineTuneOutput(
+        status="failed",
+        error=public_error,
+        gpu_type=device,
+        failure_class=failure_class,
+        retryable=retryable,
+    )
 
 
 def _detect_device() -> str:
@@ -721,6 +842,59 @@ def _detect_vram_gb() -> float | None:
     return None
 
 
+def _detect_gfx_target() -> str | None:
+    """Best-effort AMD GFX target from an explicit hint or runtime report."""
+    explicit = (os.environ.get("OPENREEF_GFX_TARGET") or "").strip().lower()
+    if explicit:
+        return explicit.split(":", 1)[0]
+    try:
+        report_path = Path(
+            os.environ.get(
+                "OPENREEF_RUNTIME_REPORT_PATH", "/workspace/openreef_runtime.json"
+            )
+        )
+        if report_path.is_file():
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            gfx_target = str((data.get("gpu") or {}).get("gfx_arch") or "").strip()
+            if gfx_target:
+                return gfx_target.lower().split(":", 1)[0]
+    except Exception:
+        pass
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            gfx_target = str(getattr(props, "gcnArchName", "") or "").strip()
+            if gfx_target:
+                return gfx_target.lower().split(":", 1)[0]
+    except Exception:
+        pass
+    return None
+
+
+def _apply_rdna4_balanced_safety(
+    config: dict[str, Any],
+    *,
+    device: str,
+    gfx_target: str | None,
+    preset: str,
+) -> bool:
+    """Avoid the reproducible gfx1200 page-fault shape without changing pricing."""
+    gfx = (gfx_target or "").lower().split(":", 1)[0]
+    if (
+        device != "amd_rocm"
+        or gfx != "gfx1200"
+        or (preset or "").lower() != "balanced"
+        or int(config.get("lora_r") or 0) != 32
+        or int(config.get("lora_alpha") or 0) != 64
+    ):
+        return False
+    config["lora_r"] = 64
+    config["lora_alpha"] = 128
+    return True
+
+
 def _probe_tokenizer_has_chat_template(base_model: str) -> bool | None:
     """Return True/False if tokenizer loads; None if probe fails (offline/gated).
 
@@ -767,11 +941,29 @@ def _probe_tokenizer_has_chat_template(base_model: str) -> bool | None:
 
 
 def _resolved_prompt_format(job_input: FineTuneInput) -> str | None:
-    """Job field wins, then OPENREEF_PROMPT_FORMAT env, else auto."""
+    """Job field wins, then OPENREEF_PROMPT_FORMAT, then SFT profile, else auto.
+
+    Maps SFT contract profiles to Axolotl prompt formats:
+      chat → chat (chat_template)
+      completion → alpaca (fixed Instruction/Response)
+      experimental → auto (tokenizer probe)
+    """
     if job_input.prompt_format and str(job_input.prompt_format).strip():
         return str(job_input.prompt_format).strip()
     env = (os.environ.get("OPENREEF_PROMPT_FORMAT") or "").strip()
-    return env or None
+    if env:
+        return env
+    sft = (
+        getattr(job_input, "sft_profile", None)
+        or os.environ.get("OPENREEF_SFT_PROFILE")
+        or "chat"
+    )
+    sft = str(sft).strip().lower()
+    if sft == "chat":
+        return "chat"
+    if sft == "completion":
+        return "alpaca"
+    return None
 
 
 def _gpu_count() -> int:
@@ -789,15 +981,21 @@ def _gpu_count() -> int:
     return 0
 
 
-def _select_train_engine(device: str) -> str:
+def _select_train_engine(device: str, preset: str = "balanced") -> str:
     """Pick train engine (see docs/training-engine.md in monorepo).
 
-    Policy (auto):
-      - 1 GPU  → Unsloth when installed (default OpenReef path)
-      - ≥2 GPUs → Axolotl (multi-GPU / Accelerate niche)
+    Policy (auto) — 2026-08-11:
+      - NVIDIA 1 GPU → Unsloth when installed
+      - AMD/ROCm     → Axolotl (product default; Unsloth AMD is experimental only)
+      - ≥2 GPUs      → Axolotl (multi-GPU / Accelerate)
       - force OPENREEF_TRAIN_ENGINE=unsloth|axolotl
     """
+    if preset == "custom" and (device != "nvidia_cuda" or _gpu_count() != 1):
+        raise RuntimeError("Custom mode requires one NVIDIA GPU")
+
     force = (os.environ.get("OPENREEF_TRAIN_ENGINE") or "auto").strip().lower()
+    if preset == "custom" and force == "axolotl":
+        raise RuntimeError("Custom mode requires the NVIDIA Unsloth engine")
     if force in ("unsloth", "axolotl"):
         if force == "unsloth":
             try:
@@ -820,8 +1018,16 @@ def _select_train_engine(device: str) -> str:
         )
         return "axolotl"
 
-    # Single-GPU (or unknown count): Unsloth on CUDA and ROCm images.
-    if device in ("nvidia_cuda", "amd_rocm"):
+    # AMD product path: Axolotl. Do not auto-pick Unsloth on ROCm even if installed
+    # (Day-0 / hybrid models have failed with NaN on RDNA4; see training-engine.md).
+    if device == "amd_rocm":
+        ogpu.service.logger.info(
+            "train_engine=auto → axolotl (amd_rocm product default)"
+        )
+        return "axolotl"
+
+    # NVIDIA single-GPU: Unsloth when present.
+    if device == "nvidia_cuda":
         try:
             from unsloth_train import unsloth_available
 
@@ -830,10 +1036,36 @@ def _select_train_engine(device: str) -> str:
         except Exception:
             pass
         ogpu.service.logger.warning(
-            "Unsloth not available on %s image; falling back to Axolotl", device
+            "Unsloth not available on nvidia_cuda image; falling back to Axolotl"
         )
         return "axolotl"
     return "axolotl"
+
+
+def _axolotl_train_command(
+    training_python: str,
+    config_path: str,
+    *,
+    gpu_count: int | None = None,
+    wrapper_path: str | None = None,
+) -> list[str]:
+    """Build the Axolotl command, using Accelerate for visible multi-GPU nodes."""
+    n_gpu = _gpu_count() if gpu_count is None else max(0, int(gpu_count))
+    if n_gpu >= 2:
+        cmd = [
+            training_python,
+            "-m",
+            "accelerate.commands.launch",
+            "--multi_gpu",
+            "--num_processes",
+            str(n_gpu),
+        ]
+        if wrapper_path:
+            return [*cmd, wrapper_path]
+        return [*cmd, "-m", "axolotl.cli.train", config_path]
+    if wrapper_path:
+        return [training_python, wrapper_path]
+    return [training_python, "-m", "axolotl.cli.train", config_path]
 
 
 def _build_axolotl_config(
@@ -876,6 +1108,7 @@ def _build_axolotl_config(
         vram_gb=vram_gb,
         prompt_format=prompt_format,
         has_chat_template=has_chat_template,
+        custom_config=job_input.custom_config,
     )
     # Optional *non-hardware* overrides from claim/backend.
     # Never apply sequence_len / batch / packing from the claim: claim hyperparams
@@ -884,6 +1117,24 @@ def _build_axolotl_config(
         config["lora_r"] = job_input.lora_r
     if job_input.lora_alpha:
         config["lora_alpha"] = job_input.lora_alpha
+    gfx_target = _detect_gfx_target() if device == "amd_rocm" else None
+    if _apply_rdna4_balanced_safety(
+        config,
+        device=device,
+        gfx_target=gfx_target,
+        preset=job_input.preset,
+    ):
+        ogpu.service.logger.warning(
+            "Applying gfx1200 balanced safety profile: LoRA r32/alpha64 -> "
+            "r64/alpha128 (epochs/LR/price unchanged)"
+        )
+        _phase(
+            "config_safety",
+            reason="gfx1200_balanced_rank32_page_fault",
+            gfx_target=gfx_target,
+            lora_r=64,
+            lora_alpha=128,
+        )
     # val_set_size: allow override only when dataset is large enough to split.
     if job_input.val_set_size is not None and (
         num_dataset_rows is None or int(num_dataset_rows) >= 32
@@ -903,7 +1154,7 @@ def _build_axolotl_config(
     ds_type = ds0.get("type")
     ogpu.service.logger.info(
         "Axolotl config: preset=%s device=%s adapter=%s seq=%s batch=%s packing=%s "
-        "rows=%s vram_gb=%s lora_r=%s val=%.2f gc=%s chat_template=%s dataset_type=%s "
+        "rows=%s vram_gb=%s gfx=%s lora_r=%s val=%.2f gc=%s chat_template=%s dataset_type=%s "
         "prompt_reason=%s has_chat_template=%s",
         job_input.preset,
         device,
@@ -913,6 +1164,7 @@ def _build_axolotl_config(
         config.get("sample_packing"),
         num_dataset_rows,
         vram_gb,
+        gfx_target,
         config.get("lora_r"),
         float(config.get("val_set_size") or 0),
         config.get("gradient_checkpointing"),
@@ -990,7 +1242,7 @@ def _extract_training_error(log_path: Path, *, max_chars: int = 2500) -> str:
         and "Saving the dataset" not in ln
         and "huggingface/tokenizers" not in ln
     ]
-    # Prefer lines that look like hard failures
+    # Prefer lines that look like hard failures (include ROCm GPU page-faults)
     hard = [
         ln
         for ln in useful
@@ -1006,11 +1258,245 @@ def _extract_training_error(log_path: Path, *, max_chars: int = 2500) -> str:
                 "ValueError",
                 "out of memory",
                 "FAILED",
+                "Memory access fault",
+                "Page not present",
+                "GPU coredump",
+                "HSA_STATUS",
+                "SIGABRT",
             )
         )
     ]
     blob = "\n".join(hard[-40:] if hard else (useful if useful else lines))
     return blob[-max_chars:]
+
+
+def _parse_axolotl_train_loss(log_path: Path) -> float | None:
+    """Best-effort aggregate train loss, with batch loss as legacy fallback."""
+    if not log_path.is_file():
+        return None
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    import re
+
+    matches = re.findall(r"['\"]train_loss['\"]\s*:\s*['\"]?([0-9.eE+-]+)", text)
+    if not matches:
+        matches = re.findall(r"\btrain_loss[=:]\s*([0-9.eE+-]+)", text)
+    if not matches:
+        matches = re.findall(r"['\"]loss['\"]\s*:\s*['\"]?([0-9.eE+-]+)", text)
+    if not matches:
+        matches = re.findall(r"\bloss[=:]\s*([0-9.eE+-]+)", text)
+    for raw in reversed(matches):
+        try:
+            v = float(raw)
+            if v == v:  # not NaN
+                return v
+        except Exception:
+            continue
+    return None
+
+
+def _run_axolotl_sft_contract(
+    *,
+    base_model: str,
+    output_dir: Path,
+    dataset_path: Path,
+    device: str,
+    adapter: str,
+    preset: str,
+    sft_profile: str,
+    prompt_reason: str | None,
+    log_path: Path,
+    phase: Callable[..., None],
+) -> None:
+    """Post-train serve_smoke + openreef_train_manifest for Axolotl path.
+
+    Raises RuntimeError if serve_smoke is enabled and fails.
+    """
+    from sft_format import (
+        is_garbage_generation,
+        normalize_messages,
+        pick_smoke_prompts,
+        render_inference_prompt,
+        write_train_manifest,
+    )
+
+    serve_smoke = os.environ.get("OPENREEF_SERVE_SMOKE", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+    profile = (sft_profile or "chat").strip().lower()
+    # Infer renderer from prompt path (chat_template vs alpaca/completion).
+    renderer = "chat_template"
+    if profile == "completion" or (prompt_reason or "").startswith("force_alpaca"):
+        renderer = "completion_v1"
+    elif (prompt_reason or "") in (
+        "tokenizer_no_chat_template",
+        "name_heuristic_base",
+        "force_alpaca",
+    ):
+        renderer = "completion_v1"
+
+    rows: list[dict] = []
+    if dataset_path.is_file():
+        with dataset_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    rows.append(obj)
+
+    train_loss = _parse_axolotl_train_loss(log_path)
+    smoke_report: dict = {"enabled": serve_smoke, "ok": True, "items": [], "renderer": renderer}
+
+    if serve_smoke:
+        phase("serve_smoke_start", n=3, renderer=renderer, engine="axolotl")
+        try:
+            import torch
+            from peft import PeftModel
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            token = (
+                os.environ.get("HF_TOKEN")
+                or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+                or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+                or None
+            )
+            tok_kwargs: dict = {"trust_remote_code": True}
+            if token:
+                tok_kwargs["token"] = token
+            # Prefer adapter dir tokenizer (saved with train) then base.
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(str(output_dir), **tok_kwargs)
+            except Exception:
+                tokenizer = AutoTokenizer.from_pretrained(base_model, **tok_kwargs)
+
+            dtype = torch.float16 if device == "amd_rocm" else torch.bfloat16
+            model_kwargs: dict = {
+                "trust_remote_code": True,
+                "torch_dtype": dtype,
+                "device_map": "auto",
+            }
+            if token:
+                model_kwargs["token"] = token
+            base = AutoModelForCausalLM.from_pretrained(base_model, **model_kwargs)
+            model = PeftModel.from_pretrained(base, str(output_dir))
+            model.eval()
+
+            pairs = pick_smoke_prompts(rows, n=3)
+            if not pairs:
+                smoke_report["ok"] = False
+                smoke_report["items"].append({"ok": False, "reason": "no_smoke_prompts"})
+            else:
+                for user, gold in pairs:
+                    prompt = render_inference_prompt(user, tokenizer, renderer=renderer)
+                    inputs = tokenizer(prompt, return_tensors="pt")
+                    try:
+                        dev = next(model.parameters()).device
+                        inputs = {k: v.to(dev) for k, v in inputs.items()}
+                        with torch.inference_mode():
+                            out = model.generate(
+                                **inputs,
+                                max_new_tokens=96,
+                                do_sample=False,
+                                pad_token_id=getattr(tokenizer, "eos_token_id", None)
+                                or getattr(tokenizer, "pad_token_id", None),
+                            )
+                        gen = tokenizer.decode(
+                            out[0][inputs["input_ids"].shape[-1] :],
+                            skip_special_tokens=True,
+                        ).strip()
+                    except Exception as exc:
+                        smoke_report["ok"] = False
+                        smoke_report["items"].append(
+                            {
+                                "ok": False,
+                                "reason": f"generate_error:{type(exc).__name__}",
+                                "user": user[:80],
+                            }
+                        )
+                        continue
+                    bad, reason = is_garbage_generation(gen)
+                    item = {
+                        "ok": not bad,
+                        "reason": reason,
+                        "user": user[:120],
+                        "gold_preview": gold[:80],
+                        "gen_preview": gen[:200],
+                    }
+                    if bad:
+                        smoke_report["ok"] = False
+                    smoke_report["items"].append(item)
+
+            # Free VRAM before packaging/upload
+            try:
+                del model, base
+                import gc
+
+                gc.collect()
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        except Exception as exc:
+            smoke_report["ok"] = False
+            smoke_report["items"].append(
+                {"ok": False, "reason": f"smoke_setup:{type(exc).__name__}:{str(exc)[:120]}"}
+            )
+            ogpu.service.logger.exception("Axolotl serve_smoke setup failed: %s", exc)
+
+        if smoke_report["ok"]:
+            phase("serve_smoke_ok", n=len(smoke_report.get("items") or []), engine="axolotl")
+        else:
+            phase("serve_smoke_failed", n=len(smoke_report.get("items") or []), engine="axolotl")
+            reasons = "; ".join(
+                str(it.get("reason"))
+                for it in smoke_report.get("items") or []
+                if not it.get("ok")
+            )
+            raise RuntimeError(f"SFT serve_smoke failed after train: {reasons or 'unknown'}")
+
+    write_train_manifest(
+        output_dir / "openreef_train_manifest.json",
+        {
+            "schema": "openreef.sft_manifest.v1",
+            "base_model": base_model,
+            "sft_profile": profile,
+            "prompt_renderer": renderer,
+            "prompt_reason": prompt_reason,
+            "engine": "axolotl",
+            "device": device,
+            "adapter": adapter,
+            "preset": preset,
+            "num_train_rows": len(rows),
+            "train_loss": train_loss,
+            "dtype": "float16" if device == "amd_rocm" else "bfloat16",
+            "smoke": smoke_report,
+        },
+    )
+    phase(
+        "axolotl_manifest_ok",
+        renderer=renderer,
+        smoke_ok=smoke_report.get("ok"),
+        train_loss=train_loss,
+    )
+    (output_dir / "openreef_training_metrics.json").write_text(
+        json.dumps(
+            {
+                "train_loss": train_loss,
+                "eval_loss": None,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _find_adapter_file(output_dir: Path) -> Path | None:
@@ -1033,6 +1519,29 @@ def _find_adapter_file(output_dir: Path) -> Path | None:
             return f
 
     return None
+
+
+def _read_training_metrics(output_dir: Path) -> dict | None:
+    metrics_path = output_dir / "openreef_training_metrics.json"
+    try:
+        value = json.loads(metrics_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(value, dict):
+        return None
+    summary: dict = {}
+    for key in ("train_loss", "eval_loss", "global_step", "epoch"):
+        raw = value.get(key)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            continue
+        number = float(raw)
+        if number == number and abs(number) != float("inf"):
+            summary[key] = raw
+    for key in ("best_checkpoint", "resumed_from_checkpoint"):
+        raw = value.get(key)
+        if isinstance(raw, str) and raw.strip():
+            summary[key] = raw.strip()[:255]
+    return summary or None
 
 
 def _package_adapter_output(adapter_path: Path, max_size_bytes: int = 2 * 1024 * 1024 * 1024) -> Path:
@@ -1310,6 +1819,9 @@ class _ClaimantHeartbeat:
                 if isinstance(step, int) and isinstance(max_steps, int) and max_steps > 0:
                     payload["step"] = step
                     payload["max_steps"] = max_steps
+                metrics = snap.get("metrics")
+                if isinstance(metrics, dict) and metrics:
+                    payload["metrics"] = metrics
 
                 body = json.dumps(payload).encode("utf-8")
                 req = urllib.request.Request(
@@ -1353,6 +1865,41 @@ class _ClaimantHeartbeat:
         )
         self._thread.start()
         _phase("heartbeat_loop_started", interval_s=self.interval)
+
+    def pulse(self) -> None:
+        """One-shot heartbeat (e.g. final fail phase before stop). Best-effort."""
+        if not self.url or not self.token:
+            return
+        try:
+            import urllib.error
+            import urllib.request
+
+            snap = _snapshot_progress()
+            payload: dict[str, object] = {"token": self.token}
+            phase = snap.get("phase")
+            if isinstance(phase, str) and phase:
+                payload["phase"] = phase
+            pct = snap.get("progress_pct")
+            if isinstance(pct, int):
+                payload["progress_pct"] = pct
+            detail = snap.get("detail")
+            if isinstance(detail, str) and detail:
+                payload["detail"] = detail[:500]
+            body = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                self.url,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "User-Agent": "openreef-finetune-worker/1.0",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+        except Exception:
+            pass
 
     def stop(self) -> None:
         if self._stop is not None:
@@ -1614,18 +2161,37 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
     """Execute the fine-tuning job.
 
     Detects hardware and selects the train engine:
-    NVIDIA CUDA → Unsloth (primary); AMD ROCm → Unsloth (experiment).
+    NVIDIA CUDA → Unsloth (single-GPU); AMD ROCm → Axolotl;
+    multi-GPU → Axolotl.
     Override with OPENREEF_TRAIN_ENGINE=unsloth|axolotl|auto.
     Returns the adapter as base64 (for small adapters) or uploads to R2
     and returns the output key.
     """
     _setup_workspace_file_logging()
+    paused_reason = provider_pause_reason()
+    if paused_reason:
+        _phase("provider_paused", reason=paused_reason)
+        return FineTuneOutput(status="failed", error="OpenReef provider is paused")
     job_t0 = time.monotonic()
     heartbeat: _ClaimantHeartbeat | None = None
 
     def _finish(output: FineTuneOutput) -> FineTuneOutput:
         if heartbeat is not None:
+            # Best-effort final pulse so Lab/backend see fail phase before silence.
+            if getattr(output, "status", None) == "failed":
+                try:
+                    detail = (output.error or "training failed")[:200]
+                    _set_progress(
+                        phase="train_failed"
+                        if getattr(output, "failure_class", None) != "gpu_fault"
+                        else "gpu_fault",
+                        detail=detail,
+                    )
+                    heartbeat.pulse()
+                except Exception:
+                    pass
             heartbeat.stop()
+        clear_training_active()
         return output
 
     # Resolve opaque claim before logging model/dataset details.
@@ -1634,6 +2200,7 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
         or os.environ.get("TASK_ADDRESS")
         or os.environ.get("OGPU_CURRENT_TASK")
     )
+    mark_training_active(task_address)
     has_claim = bool(getattr(data, "openreef", None))
     _phase(
         "job_start",
@@ -1689,6 +2256,11 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
     try:
         device = _verify_expected_device()
         _validate_runtime(device)
+        if data.preset == "custom":
+            if device != "nvidia_cuda" or _gpu_count() != 1:
+                raise RuntimeError("Custom mode requires one NVIDIA GPU")
+            if not data.custom_config:
+                raise RuntimeError("Custom mode requires custom_config")
         _phase("device_ok", device=device, base_model=data.base_model, preset=data.preset, adapter=data.adapter)
     except Exception as e:
         _phase("device_fail", error=str(e))
@@ -1764,7 +2336,7 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
                 reason=guard.reason,
             )
 
-        train_engine = _select_train_engine(device)
+        train_engine = _select_train_engine(device, data.preset)
         _phase("train_engine", engine=train_engine, device=device)
         log_path = work_dir / ("unsloth.log" if train_engine == "unsloth" else "axolotl.log")
         train_s = 0.0
@@ -1781,6 +2353,7 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
                 device=device,
                 adapter=data.adapter,
                 num_dataset_rows=num_rows,
+                custom_config=data.custom_config,
             )
             _phase(
                 "config_ok",
@@ -1802,6 +2375,10 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
                     .strip()
                     .lower()
                 )
+                checkpoint_scope = hashlib.sha256(
+                    (data.output_prefix or data.base_model).encode("utf-8")
+                ).hexdigest()[:24]
+                checkpoint_dir = work_dir / "checkpoints" / checkpoint_scope
                 run_unsloth_sft(
                     base_model=data.base_model,
                     dataset_path=dataset_path,
@@ -1819,6 +2396,8 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
                     sft_profile=sft_profile,
                     serve_smoke=os.environ.get("OPENREEF_SERVE_SMOKE", "1").strip()
                     not in ("0", "false", "no"),
+                    custom_config=data.custom_config,
+                    checkpoint_dir=checkpoint_dir,
                 )
                 train_s = round(time.monotonic() - train_t0, 1)
                 _phase("train_exit", code=0, seconds=train_s, engine="unsloth")
@@ -1831,12 +2410,35 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
                         tail = _read_text_tail(log_path, max_chars=1200)
                         if tail.strip():
                             _phase("train_log_tail", text=tail.replace("\n", " | "))
+                            err = f"{err}\n{tail}"
                 except Exception:
                     pass
-                _phase("train_failed", code=1, seconds=train_s, engine="unsloth", error=err[:200])
-                _phase("job_failed", reason="train", total_s=round(time.monotonic() - job_t0, 1))
+                failure_class, public_err, retryable = classify_train_failure(
+                    error_text=err, returncode=1, device=device
+                )
+                _phase(
+                    "train_failed",
+                    code=1,
+                    seconds=train_s,
+                    engine="unsloth",
+                    failure_class=failure_class,
+                    retryable=retryable,
+                    error=public_err[:200],
+                )
+                _phase(
+                    "job_failed",
+                    reason="train",
+                    failure_class=failure_class,
+                    total_s=round(time.monotonic() - job_t0, 1),
+                )
                 return _finish(
-                    FineTuneOutput(status="failed", error=err[:2200], gpu_type=device)
+                    FineTuneOutput(
+                        status="failed",
+                        error=public_err,
+                        gpu_type=device,
+                        failure_class=failure_class,
+                        retryable=retryable,
+                    )
                 )
         else:
             # Axolotl CLI path (AMD ROCm default, or OPENREEF_TRAIN_ENGINE=axolotl).
@@ -1861,18 +2463,20 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
 
             env["AXOLOTL_DO_NOT_TRACK"] = "1"
             training_python = env.get("OPENREEF_TRAINING_PYTHON") or "python"
+            visible_gpu_count = _gpu_count()
+            wrapper = None
             if guard.enabled:
                 wrapper = write_vram_cap_wrapper(
                     work_dir,
                     training_python=training_python,
                     config_path=str(config_path),
                 )
-                train_cmd = [training_python, wrapper]
-            else:
-                train_cmd = [
-                    training_python, "-m", "axolotl.cli.train",
-                    str(config_path),
-                ]
+            train_cmd = _axolotl_train_command(
+                training_python,
+                str(config_path),
+                gpu_count=visible_gpu_count,
+                wrapper_path=wrapper,
+            )
 
             _phase(
                 "train_start",
@@ -1880,6 +2484,8 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
                 timeout_s=timeout_seconds,
                 axolotl_log=str(log_path),
                 engine="axolotl",
+                launcher="accelerate" if visible_gpu_count >= 2 else "python",
+                gpu_count=visible_gpu_count,
             )
             train_t0 = time.monotonic()
             with log_path.open("w", encoding="utf-8") as train_log:
@@ -1918,17 +2524,112 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
                         _phase("train_log_tail", text=ax_tail.replace("\n", " | "))
                 except Exception:
                     pass
-                ogpu.service.logger.error("Training failed: %s", error_tail)
+                failure_class, public_err, retryable = classify_train_failure(
+                    error_text=error_tail,
+                    returncode=result.returncode,
+                    device=device,
+                )
+                ogpu.service.logger.error(
+                    "Training failed class=%s retryable=%s rc=%s: %s",
+                    failure_class,
+                    retryable,
+                    result.returncode,
+                    error_tail[:500],
+                )
                 _phase(
                     "train_failed",
                     code=result.returncode,
                     seconds=train_s,
-                    error=(error_tail[:200] + "…") if len(error_tail) > 200 else error_tail,
+                    engine="axolotl",
+                    failure_class=failure_class,
+                    retryable=retryable,
+                    error=(public_err[:200] + "…") if len(public_err) > 200 else public_err,
                 )
-                if len(error_tail) > 2200:
-                    error_tail = "…" + error_tail[-2199:]
-                _phase("job_failed", reason="train", total_s=round(time.monotonic() - job_t0, 1))
-                return _finish(FineTuneOutput(status="failed", error=error_tail, gpu_type=device))
+                _phase(
+                    "job_failed",
+                    reason="train",
+                    failure_class=failure_class,
+                    total_s=round(time.monotonic() - job_t0, 1),
+                )
+                return _finish(
+                    FineTuneOutput(
+                        status="failed",
+                        error=public_err,
+                        gpu_type=device,
+                        failure_class=failure_class,
+                        retryable=retryable,
+                    )
+                )
+
+            # SFT contract: serve_smoke + train manifest (Axolotl)
+            try:
+                sft_prof = (
+                    getattr(data, "sft_profile", None)
+                    or os.environ.get("OPENREEF_SFT_PROFILE")
+                    or "chat"
+                )
+                prompt_reason = None
+                try:
+                    # Re-read yaml for prompt metadata if present
+                    cfg2 = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
+                    prompt_reason = cfg2.get("_openreef_prompt_reason")
+                except Exception:
+                    pass
+                # prompt_reason is stripped before write — recover from phase log fields
+                # via config rebuild reason: re-resolve
+                from training_config import resolve_use_chat_template
+
+                _use_chat, prompt_reason = resolve_use_chat_template(
+                    data.base_model,
+                    prompt_format=_resolved_prompt_format(data),
+                    has_chat_template=_probe_tokenizer_has_chat_template(data.base_model),
+                )
+                _run_axolotl_sft_contract(
+                    base_model=data.base_model,
+                    output_dir=work_dir / "output",
+                    dataset_path=work_dir / "dataset.jsonl",
+                    device=device,
+                    adapter=str(data.adapter or "lora"),
+                    preset=str(data.preset or "balanced"),
+                    sft_profile=str(sft_prof),
+                    prompt_reason=prompt_reason,
+                    log_path=log_path,
+                    phase=_phase,
+                )
+            except RuntimeError as smoke_err:
+                ogpu.service.logger.error("Axolotl SFT contract failed: %s", smoke_err)
+                _phase(
+                    "train_failed",
+                    code=1,
+                    seconds=train_s,
+                    engine="axolotl",
+                    error=str(smoke_err)[:200],
+                )
+                _phase("job_failed", reason="serve_smoke", total_s=round(time.monotonic() - job_t0, 1))
+                return _finish(
+                    FineTuneOutput(
+                        status="failed",
+                        error=str(smoke_err)[:2200],
+                        gpu_type=device,
+                    )
+                )
+            except Exception as smoke_err:
+                ogpu.service.logger.exception("Axolotl SFT contract error: %s", smoke_err)
+                _phase(
+                    "train_failed",
+                    code=1,
+                    seconds=train_s,
+                    engine="axolotl",
+                    error=f"{type(smoke_err).__name__}: {smoke_err}"[:200],
+                )
+                _phase("job_failed", reason="serve_smoke", total_s=round(time.monotonic() - job_t0, 1))
+                return _finish(
+                    FineTuneOutput(
+                        status="failed",
+                        error=f"{type(smoke_err).__name__}: {smoke_err}"[:2200],
+                        gpu_type=device,
+                    )
+                )
 
         # 4. Find and return the adapter
         _phase("artifact_start")
@@ -1960,6 +2661,9 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
             ogpu.service.logger.info("Training complete. Artifact uploaded to R2 via presigned URL.")
             _phase("upload_ok")
             _phase("job_done", total_s=round(time.monotonic() - job_t0, 1), train_s=train_s)
+            training_metrics = _read_training_metrics(output_dir)
+            if train_engine == "unsloth" and checkpoint_dir.exists():
+                shutil.rmtree(checkpoint_dir, ignore_errors=True)
             return _finish(FineTuneOutput(
                 status="completed",
                 output_key=data.output_key or None,
@@ -1967,6 +2671,7 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
                 artifact_sha256=artifact_sha256,
                 artifact_size_bytes=artifact_size,
                 gpu_type=device,
+                training_metrics=training_metrics,
             ))
 
         # Try to encode as base64 when no upload URL is available.
@@ -1974,6 +2679,9 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
         if adapter_b64:
             ogpu.service.logger.info("Returning adapter as base64 (%.1f MB encoded)", len(adapter_b64) / 1024 / 1024)
             _phase("job_done", total_s=round(time.monotonic() - job_t0, 1), mode="base64")
+            training_metrics = _read_training_metrics(output_dir)
+            if train_engine == "unsloth" and checkpoint_dir.exists():
+                shutil.rmtree(checkpoint_dir, ignore_errors=True)
             return _finish(FineTuneOutput(
                 status="completed",
                 adapter_base64=adapter_b64,
@@ -1981,6 +2689,7 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
                 artifact_sha256=artifact_sha256,
                 artifact_size_bytes=artifact_size,
                 gpu_type=device,
+                training_metrics=training_metrics,
             ))
 
         ogpu.service.logger.error("No upload_url provided for large adapter upload")
@@ -2120,13 +2829,22 @@ def _install_ogpu_task_address_env_patch() -> None:
 
 
 if __name__ == "__main__":
+    # A recreated worker cannot own an active job from its previous process.
+    # Clear only this runtime marker; operator pause/update markers remain authoritative.
+    clear_training_active()
     paused_reason = provider_pause_reason()
-    if paused_reason:
+    if paused_reason and pause_file_path().is_file():
         print(
             f"PHASE=provider_paused reason={paused_reason}",
             file=sys.stderr,
             flush=True,
         )
         raise SystemExit(0)
+    if paused_reason:
+        print(
+            f"PHASE=provider_draining reason={paused_reason}",
+            file=sys.stderr,
+            flush=True,
+        )
     _install_ogpu_task_address_env_patch()
     ogpu.service.start()

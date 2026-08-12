@@ -9,6 +9,7 @@ from pathlib import Path
 from zipfile import ZipFile
 
 import pytest
+import yaml
 
 
 WORKER_PATH = Path(__file__).resolve().parents[1] / "worker.py"
@@ -34,6 +35,225 @@ def _load_worker(monkeypatch):
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def test_classify_train_failure_gpu_page_fault(monkeypatch):
+    worker = _load_worker(monkeypatch)
+    fc, msg, retryable = worker.classify_train_failure(
+        error_text=(
+            "Memory access fault by GPU node-1 (Agent handle: 0x4a32ea60) "
+            "on address 0x75ece8600000. Reason: Page not present or supervisor privilege."
+        ),
+        returncode=-6,
+        device="amd_rocm",
+    )
+    assert fc == "gpu_fault"
+    assert retryable is False
+    assert msg.startswith("gpu_fault:")
+
+
+def test_classify_train_failure_sigabrt_on_amd_without_markers(monkeypatch):
+    worker = _load_worker(monkeypatch)
+    fc, msg, retryable = worker.classify_train_failure(
+        error_text="tokens/total': 8710, 'epoch': '0.03988'}",
+        returncode=-6,
+        device="amd_rocm",
+    )
+    assert fc == "gpu_fault"
+    assert retryable is False
+    assert "dataset" in msg.lower()
+
+
+def test_classify_train_failure_ordinary_error_retryable(monkeypatch):
+    worker = _load_worker(monkeypatch)
+    fc, msg, retryable = worker.classify_train_failure(
+        error_text="RuntimeError: loss is NaN",
+        returncode=1,
+        device="amd_rocm",
+    )
+    assert fc == "train_error"
+    assert retryable is True
+    assert "NaN" in msg
+
+
+def test_parse_axolotl_train_loss_accepts_quoted_metric(monkeypatch, tmp_path):
+    worker = _load_worker(monkeypatch)
+    log = tmp_path / "axolotl.log"
+    log.write_text(
+        "{'loss': '0.125', 'epoch': '1.0'}\n"
+        "{'loss': '0.02525', 'epoch': '1.993'}\n",
+        encoding="utf-8",
+    )
+
+    assert worker._parse_axolotl_train_loss(log) == pytest.approx(0.02525)
+
+
+def test_parse_axolotl_train_loss_prefers_aggregate_metric(monkeypatch, tmp_path):
+    worker = _load_worker(monkeypatch)
+    log = tmp_path / "axolotl.log"
+    log.write_text(
+        "{'loss': '0.000708', 'epoch': '3.985'}\n"
+        "{'train_runtime': '1243', 'train_loss': '0.3243', 'epoch': '3.997'}\n",
+        encoding="utf-8",
+    )
+
+    assert worker._parse_axolotl_train_loss(log) == pytest.approx(0.3243)
+
+
+def test_select_train_engine_matrix(monkeypatch):
+    worker = _load_worker(monkeypatch)
+    fake = types.ModuleType("unsloth_train")
+    fake.unsloth_available = lambda: True
+    monkeypatch.setitem(sys.modules, "unsloth_train", fake)
+    monkeypatch.delenv("OPENREEF_TRAIN_ENGINE", raising=False)
+
+    monkeypatch.setattr(worker, "_gpu_count", lambda: 1)
+    assert worker._select_train_engine("nvidia_cuda") == "unsloth"
+    assert worker._select_train_engine("amd_rocm") == "axolotl"
+
+    monkeypatch.setattr(worker, "_gpu_count", lambda: 2)
+    assert worker._select_train_engine("nvidia_cuda") == "axolotl"
+    assert worker._select_train_engine("amd_rocm") == "axolotl"
+
+
+def test_custom_engine_is_single_gpu_nvidia_only(monkeypatch):
+    worker = _load_worker(monkeypatch)
+    fake = types.ModuleType("unsloth_train")
+    fake.unsloth_available = lambda: True
+    monkeypatch.setitem(sys.modules, "unsloth_train", fake)
+    monkeypatch.delenv("OPENREEF_TRAIN_ENGINE", raising=False)
+
+    monkeypatch.setattr(worker, "_gpu_count", lambda: 1)
+    assert worker._select_train_engine("nvidia_cuda", "custom") == "unsloth"
+    with pytest.raises(RuntimeError, match="one NVIDIA GPU"):
+        worker._select_train_engine("amd_rocm", "custom")
+
+    monkeypatch.setattr(worker, "_gpu_count", lambda: 2)
+    with pytest.raises(RuntimeError, match="one NVIDIA GPU"):
+        worker._select_train_engine("nvidia_cuda", "custom")
+
+
+def test_custom_hyperparameters_are_resolved_without_floating_fields():
+    from training_config import resolve_training_hyperparams
+
+    custom = {
+        "num_epochs": 4,
+        "learning_rate": 5e-5,
+        "lora_r": 64,
+        "lora_alpha": 128,
+        "sequence_len": 4096,
+        "weight_decay": 0.03,
+        "save_steps": 20,
+        "save_total_limit": 2,
+    }
+    resolved = resolve_training_hyperparams("custom", custom_config=custom)
+
+    assert resolved["num_epochs"] == 4
+    assert resolved["learning_rate"] == pytest.approx(5e-5)
+    assert resolved["lora_r"] == 64
+    assert resolved["sequence_len"] == 4096
+    assert resolved["weight_decay"] == pytest.approx(0.03)
+    assert resolved["save_steps"] == 20
+    assert resolved["save_total_limit"] == 2
+
+    with pytest.raises(ValueError, match="Unsupported Custom fields"):
+        resolve_training_hyperparams("custom", custom_config={"unknown": 1})
+
+
+def test_axolotl_train_command_single_and_multi_gpu(monkeypatch):
+    worker = _load_worker(monkeypatch)
+
+    assert worker._axolotl_train_command(
+        "python", "/workspace/config.yml", gpu_count=1
+    ) == ["python", "-m", "axolotl.cli.train", "/workspace/config.yml"]
+
+    assert worker._axolotl_train_command(
+        "python",
+        "/workspace/config.yml",
+        gpu_count=2,
+        wrapper_path="/workspace/cap.py",
+    ) == [
+        "python",
+        "-m",
+        "accelerate.commands.launch",
+        "--multi_gpu",
+        "--num_processes",
+        "2",
+        "/workspace/cap.py",
+    ]
+
+
+def test_gfx1200_balanced_uses_safe_rank_without_changing_other_profiles(monkeypatch):
+    worker = _load_worker(monkeypatch)
+    balanced = {
+        "lora_r": 32,
+        "lora_alpha": 64,
+        "num_epochs": 2,
+        "learning_rate": 1e-4,
+    }
+
+    changed = worker._apply_rdna4_balanced_safety(
+        balanced,
+        device="amd_rocm",
+        gfx_target="gfx1200:sramecc+:xnack-",
+        preset="balanced",
+    )
+
+    assert changed is True
+    assert balanced == {
+        "lora_r": 64,
+        "lora_alpha": 128,
+        "num_epochs": 2,
+        "learning_rate": 1e-4,
+    }
+
+    for device, gfx_target, preset in (
+        ("nvidia_cuda", "gfx1200", "balanced"),
+        ("amd_rocm", "gfx1100", "balanced"),
+        ("amd_rocm", "gfx1200", "fast"),
+        ("amd_rocm", "gfx1200", "custom"),
+    ):
+        config = {"lora_r": 32, "lora_alpha": 64}
+        assert worker._apply_rdna4_balanced_safety(
+            config,
+            device=device,
+            gfx_target=gfx_target,
+            preset=preset,
+        ) is False
+        assert config == {"lora_r": 32, "lora_alpha": 64}
+
+
+def test_detect_gfx_target_prefers_explicit_hint(monkeypatch):
+    worker = _load_worker(monkeypatch)
+    monkeypatch.setenv("OPENREEF_GFX_TARGET", "gfx1200:sramecc+:xnack-")
+
+    assert worker._detect_gfx_target() == "gfx1200"
+
+
+def test_build_config_applies_gfx1200_safety_after_claim_overrides(
+    monkeypatch, tmp_path
+):
+    worker = _load_worker(monkeypatch)
+    monkeypatch.setattr(worker, "_detect_device", lambda: "amd_rocm")
+    monkeypatch.setattr(worker, "_detect_vram_gb", lambda: 15.92)
+    monkeypatch.setattr(worker, "_detect_gfx_target", lambda: "gfx1200")
+    monkeypatch.setattr(worker, "_probe_tokenizer_has_chat_template", lambda _: True)
+    job = worker.FineTuneInput(
+        base_model="Qwen/Qwen3-1.7B",
+        preset="balanced",
+        adapter="lora",
+        lora_r=32,
+        lora_alpha=64,
+        val_set_size=0.05,
+    )
+
+    path = worker._build_axolotl_config(job, tmp_path, num_dataset_rows=1056)
+    config = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+
+    assert config["lora_r"] == 64
+    assert config["lora_alpha"] == 128
+    assert config["num_epochs"] == 2
+    assert config["learning_rate"] == 1e-4
 
 
 def test_provider_env_rejects_wrong_hardware(monkeypatch):
@@ -68,6 +288,31 @@ def test_package_adapter_output_includes_manifest_and_sha(monkeypatch, tmp_path)
     assert "adapter_model.safetensors" in names
     assert "adapter_config.json" in names
     assert "openreef_manifest.json" in names
+
+
+def test_read_training_metrics_returns_bounded_summary(monkeypatch, tmp_path):
+    worker = _load_worker(monkeypatch)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "openreef_training_metrics.json").write_text(
+        """{
+          "train_loss": 0.42,
+          "eval_loss": null,
+          "global_step": 120,
+          "epoch": 2.0,
+          "best_checkpoint": "checkpoint-100",
+          "log_history": [{"loss": 9}],
+          "unknown": "ignored"
+        }""",
+        encoding="utf-8",
+    )
+
+    assert worker._read_training_metrics(output_dir) == {
+        "train_loss": 0.42,
+        "global_step": 120,
+        "epoch": 2.0,
+        "best_checkpoint": "checkpoint-100",
+    }
 
 
 def test_download_dataset_rejects_redirect(monkeypatch, tmp_path):

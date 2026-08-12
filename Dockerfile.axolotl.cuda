@@ -1,0 +1,82 @@
+# OpenReef Fine-Tune Worker - NVIDIA CUDA multi-GPU (Axolotl)
+#
+# This image is deliberately separate from the single-GPU Unsloth image. It
+# gives Accelerate/Axolotl a coherent dependency stack and avoids coupling
+# Unsloth upgrades to the multi-GPU path.
+
+FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
+
+ARG TORCH_VERSION=2.9.1
+ARG TORCH_CUDA_CHANNEL=cu126
+ARG XFORMERS_VERSION=0.0.33.post2
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 \
+    python3.10-venv \
+    python3-pip \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements-build.txt requirements-worker-io.txt /tmp/
+RUN python3.10 -m venv /opt/venv \
+    && pip install --no-cache-dir -r /tmp/requirements-build.txt
+
+RUN pip install --no-cache-dir \
+    "torch==${TORCH_VERSION}" \
+    --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_CHANNEL}"
+
+# Axolotl without flash-attn is the broad compatibility baseline. SDPA remains
+# the attention implementation; Accelerate launches one process per visible GPU.
+COPY requirements-axolotl-cuda.txt /tmp/requirements-axolotl-cuda.txt
+RUN pip install --no-cache-dir \
+    -r /tmp/requirements-axolotl-cuda.txt \
+    -r /tmp/requirements-worker-io.txt \
+    "torch==${TORCH_VERSION}" \
+    "xformers==${XFORMERS_VERSION}" \
+    --extra-index-url "https://download.pytorch.org/whl/${TORCH_CUDA_CHANNEL}"
+
+COPY THIRD_PARTY_NOTICES.md /licenses/OPENREEF_THIRD_PARTY_NOTICES.md
+COPY scripts/write_dependency_inventory.py /tmp/write_dependency_inventory.py
+RUN python /tmp/write_dependency_inventory.py \
+    && rm -f /tmp/write_dependency_inventory.py
+
+RUN TORCH_VERSION="${TORCH_VERSION}" XFORMERS_VERSION="${XFORMERS_VERSION}" python - <<'PY'
+import importlib
+import importlib.metadata as metadata
+import os
+
+import torch
+
+cuda_ver = getattr(torch.version, "cuda", None)
+print("torch", torch.__version__, "cuda", cuda_ver, "hip", getattr(torch.version, "hip", None))
+if not cuda_ver:
+    raise SystemExit(
+        "FATAL: torch.version.cuda is None - this is not a CUDA wheel. "
+        "Refuse to publish a CPU/generic torch as the NVIDIA worker image."
+    )
+if torch.__version__.split("+", 1)[0] != os.environ["TORCH_VERSION"]:
+    raise SystemExit(f"FATAL: torch pin drifted: {torch.__version__}")
+if metadata.version("xformers") != os.environ["XFORMERS_VERSION"]:
+    raise SystemExit(f"FATAL: xformers pin drifted: {metadata.version('xformers')}")
+
+importlib.import_module("accelerate.commands.launch")
+importlib.import_module("axolotl.cli.train")
+print("runtime sanity OK: CUDA torch + accelerate + axolotl.cli.train")
+PY
+
+WORKDIR /workspace
+
+COPY worker.py runtime_probe.py training_config.py display_gpu_guard.py platform_compat.py pause_guard.py sft_format.py /app/
+ENV PYTHONPATH=/app \
+    TORCH_DISABLE_NATIVE_JIT=1 \
+    TORCHDYNAMO_DISABLE=1 \
+    TORCH_COMPILE_DISABLE=1 \
+    OPENREEF_TRAIN_ENGINE=axolotl
+
+ENTRYPOINT ["python", "/app/worker.py"]

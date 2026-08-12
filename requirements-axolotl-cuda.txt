@@ -1,0 +1,4 @@
+# NVIDIA multi-GPU training stack. Dependabot proposes updates by PR; the
+# non-publishing image build and real multi-GPU smoke remain required gates.
+axolotl==0.17.0
+ogpu[service]==0.2.3

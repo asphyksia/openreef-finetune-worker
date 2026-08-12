@@ -1,29 +1,11 @@
-# Fine-tune worker compose — AMD ROCm
-# Fetched by provider nodes from the source ImageEnvironments URL.
-#
-# Services:
-# - openreef-signer: CPU-only; holds PROVIDER_PRIVATE_KEY; D2 claims
-# - finetune: GPU train; no private key; claims via signer
-#
-# Critical provider notes:
-# - group "991" is the usual host `render` GID (/dev/kfd + /dev/dri/renderD*).
-#   Use numeric GID: Docker resolves names from the *container* /etc/group.
-#   If `getent group render` on the host is not 991, change this value.
-# - Never set HSA_OVERRIDE_GFX_VERSION to an empty string — it breaks HSA.
-#   Only add that env when a specific gfx override is required.
-# - Application code lives at /app in the image; /data→/workspace is job I/O only.
-#
-# Logging:
-# - docker logs <container>
-# - Host data dir (mapped to /data): logs/openreef_worker.log and OPENREEF_LOGS.txt
+# Fine-tune worker compose - NVIDIA CUDA multi-GPU (Axolotl)
+# Explicit opt-in: this image is separate from single-GPU CUDA Unsloth.
 
 services:
   openreef-signer:
-    # Pin after green smoke: OPENREEF_SIGNER_IMAGE=ghcr.io/asphyksia/openreef-signer@sha256:…
     image: ${OPENREEF_SIGNER_IMAGE:-ghcr.io/asphyksia/openreef-signer:latest}
     pull_policy: always
     restart: on-failure:3
-    # No host ports — only reachable on the compose network as openreef-signer:8787
     environment:
       - PROVIDER_PRIVATE_KEY=${PROVIDER_PRIVATE_KEY:-}
       - OPENREEF_API_BASE=${OPENREEF_API_BASE:-https://openreef.network}
@@ -49,31 +31,26 @@ services:
         labels: "openreef,signer"
 
   finetune:
-    # Pin after green smoke: FINETUNE_IMAGE=ghcr.io/asphyksia/finetune-worker@sha256:…
-    image: ${FINETUNE_IMAGE:-ghcr.io/asphyksia/finetune-worker:rocm-latest}
+    # Pin after a real multi-GPU smoke; do not use this rolling tag in an incident.
+    image: ${FINETUNE_IMAGE:-ghcr.io/asphyksia/finetune-worker:cuda-multigpu-latest}
     pull_policy: always
     depends_on:
       - openreef-signer
-    devices:
-      - /dev/kfd
-      - /dev/dri
-    security_opt:
-      - seccomp=unconfined
-    group_add:
-      - video
-      - "991"
-    ipc: host
-    shm_size: "16G"
-    cap_add:
-      - SYS_PTRACE
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     volumes:
       - /data:/workspace
     environment:
       - HF_TOKEN=${HF_TOKEN:-}
-      - OPENREEF_PROVIDER_ENV=amd_rocm
-      - TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+      - OPENREEF_PROVIDER_ENV=nvidia_cuda
+      - OPENREEF_TRAIN_ENGINE=axolotl
+      - OPENREEF_NUM_GPUS=${OPENREEF_NUM_GPUS:-}
       - CALLBACK_URL=${CALLBACK_URL:-}
-      # Claim via external signer (PK stays on openreef-signer only).
       - OPENREEF_SIGNER_URL=http://openreef-signer:8787
       - OPENREEF_SIGNER_TOKEN=${OPENREEF_SIGNER_TOKEN:-}
       - OPENREEF_API_BASE=${OPENREEF_API_BASE:-https://openreef.network}
@@ -84,15 +61,20 @@ services:
       - PYTHONUNBUFFERED=1
       - OPENREEF_HOST_OS=${OPENREEF_HOST_OS:-}
       - OPENREEF_HOST_VIRT=${OPENREEF_HOST_VIRT:-}
+      - TORCH_DISABLE_NATIVE_JIT=${TORCH_DISABLE_NATIVE_JIT:-1}
+      - TORCHDYNAMO_DISABLE=${TORCHDYNAMO_DISABLE:-1}
+      - TORCH_COMPILE_DISABLE=${TORCH_COMPILE_DISABLE:-1}
+      - OPENREEF_FORCE_EAGER_TORCH=${OPENREEF_FORCE_EAGER_TORCH:-}
     extra_hosts:
       - host.docker.internal:host-gateway
     ports:
       - ${PORT}:5555
     command: ["--config", "/workspace/config.json"]
+    runtime: nvidia
     restart: on-failure:3
     logging:
       driver: json-file
       options:
         max-size: "100m"
         max-file: "5"
-        labels: "openreef,finetune,amd"
+        labels: "openreef,finetune,nvidia,multigpu"

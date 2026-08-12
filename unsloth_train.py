@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -104,6 +105,8 @@ def run_unsloth_sft(
     phase: Callable[..., None] | None = None,
     sft_profile: str = "chat",
     serve_smoke: bool = True,
+    custom_config: dict[str, Any] | None = None,
+    checkpoint_dir: Path | None = None,
 ) -> Path:
     """Train with Unsloth and write PEFT adapter files under ``output_dir``.
 
@@ -139,6 +142,7 @@ def run_unsloth_sft(
         device=device,
         adapter=adapter,
         num_dataset_rows=num_dataset_rows,
+        custom_config=custom_config,
     )
     r = int(lora_r if lora_r is not None else hp["lora_r"])
     alpha = int(lora_alpha if lora_alpha is not None else hp["lora_alpha"])
@@ -148,6 +152,8 @@ def run_unsloth_sft(
     lr = float(hp["learning_rate"])
     max_seq = int(max_seq_length or hp.get("sequence_len") or 2048)
     targets = lora_target_modules_for_model(base_model)
+    dropout = float(hp.get("lora_dropout") or 0.0)
+    seed = int(hp.get("seed") or 3407)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -168,9 +174,6 @@ def run_unsloth_sft(
         dtype=_torch.float16 if device == "amd_rocm" else None,
         load_in_4bit=load_in_4bit,
     )
-    # Unsloth kernel path is optimized for lora_dropout=0 (see Unsloth LoRA guide).
-    dropout = 0.0
-
     model = FastLanguageModel.get_peft_model(
         model,
         r=r,
@@ -178,8 +181,11 @@ def run_unsloth_sft(
         lora_alpha=alpha,
         lora_dropout=dropout,
         bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=3407,
+        use_gradient_checkpointing=(
+            "unsloth" if hp.get("gradient_checkpointing", True) else False
+        ),
+        random_state=seed,
+        use_rslora=bool(hp.get("use_rslora", False)),
     )
     _phase("unsloth_peft_ok", r=r, alpha=alpha, targets=len(targets))
 
@@ -218,7 +224,7 @@ def run_unsloth_sft(
     eval_ds = None
     val_frac = float(hp.get("val_set_size") or 0)
     if val_frac > 0 and len(texts) >= 32:
-        split = train_ds.train_test_split(test_size=val_frac, seed=3407)
+        split = train_ds.train_test_split(test_size=val_frac, seed=seed)
         train_ds = split["train"]
         eval_ds = split["test"]
 
@@ -229,8 +235,13 @@ def run_unsloth_sft(
         log_path = Path(log_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Prefer SFTConfig (TRL ≥0.22): dataset_* / packing live on the config object.
-    sft_args = SFTConfig(
+    trainer_state_dir = Path(checkpoint_dir or (output_dir / "trainer_state"))
+    trainer_state_dir.mkdir(parents=True, exist_ok=True)
+    save_steps = max(1, int(hp.get("save_steps") or 100))
+    has_eval = eval_ds is not None
+
+    # Prefer SFTConfig (TRL >=0.22): dataset_* / packing live on the config object.
+    sft_kwargs: dict[str, Any] = dict(
         per_device_train_batch_size=micro,
         gradient_accumulation_steps=grad_accum,
         warmup_ratio=float(hp.get("warmup_ratio") or 0.05),
@@ -239,13 +250,19 @@ def run_unsloth_sft(
         fp16=not bf16,
         bf16=bf16,
         logging_steps=max(1, int(hp.get("logging_steps") or 10)),
-        optim="adamw_8bit" if device == "nvidia_cuda" else "adamw_torch",
+        optim=(
+            str(hp.get("optimizer") or "adamw_8bit")
+            if device == "nvidia_cuda"
+            else "adamw_torch"
+        ),
         weight_decay=float(hp.get("weight_decay") or 0.0),
-        lr_scheduler_type="cosine",
-        seed=3407,
-        output_dir=str(output_dir / "trainer_state"),
+        lr_scheduler_type=str(hp.get("lr_scheduler_type") or "cosine"),
+        seed=seed,
+        output_dir=str(trainer_state_dir),
         report_to="none",
-        save_strategy="no",
+        save_strategy="steps",
+        save_steps=save_steps,
+        save_total_limit=max(1, int(hp.get("save_total_limit") or 1)),
         max_grad_norm=float(hp.get("max_grad_norm") or 1.0),
         dataloader_num_workers=0,
         dataset_text_field="text",
@@ -253,6 +270,15 @@ def run_unsloth_sft(
         packing=False,
         dataset_num_proc=1,
     )
+    if has_eval:
+        sft_kwargs.update(
+            eval_strategy="steps",
+            eval_steps=save_steps,
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
+        )
+    sft_args = SFTConfig(**sft_kwargs)
 
     _phase(
         "train_start",
@@ -264,11 +290,34 @@ def run_unsloth_sft(
         rows=len(train_ds),
     )
 
+    from transformers import TrainerCallback
+
+    class _OpenReefProgressCallback(TrainerCallback):
+        def on_log(self, args, state, control, logs=None, **kwargs):  # noqa: ANN001
+            values = logs or {}
+            fields: dict[str, Any] = {
+                "step": int(getattr(state, "global_step", 0) or 0),
+                "max_steps": int(getattr(state, "max_steps", 0) or 0),
+            }
+            for key in ("loss", "eval_loss", "learning_rate", "grad_norm"):
+                value = values.get(key)
+                if isinstance(value, (int, float)):
+                    fields[key] = float(value)
+            _phase("train_metrics", **fields)
+
+    callbacks: list[Any] = [_OpenReefProgressCallback()]
+    patience = int(hp.get("early_stopping_patience") or 0)
+    if has_eval and patience > 0:
+        from transformers import EarlyStoppingCallback
+
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=patience))
+
     trainer_kwargs: dict[str, Any] = {
         "model": model,
         "train_dataset": train_ds,
         "eval_dataset": eval_ds,
         "args": sft_args,
+        "callbacks": callbacks,
     }
     # TRL 0.22 still accepts tokenizer=; newer uses processing_class=.
     try:
@@ -285,13 +334,41 @@ def run_unsloth_sft(
         except Exception:
             pass
 
-    train_out = trainer.train()
+    checkpoints: list[tuple[int, Path]] = []
+    for candidate in trainer_state_dir.glob("checkpoint-*"):
+        match = re.fullmatch(r"checkpoint-(\d+)", candidate.name)
+        if match and candidate.is_dir():
+            checkpoints.append((int(match.group(1)), candidate))
+    resume_checkpoint = max(checkpoints, default=(0, None))[1]
+    if resume_checkpoint is not None:
+        _phase("checkpoint_resume", path=str(resume_checkpoint))
+    train_out = trainer.train(
+        resume_from_checkpoint=str(resume_checkpoint) if resume_checkpoint else None
+    )
     train_loss = None
     try:
         metrics = getattr(train_out, "metrics", None) or {}
         train_loss = metrics.get("train_loss")
     except Exception:
         train_loss = None
+
+    trainer_state = getattr(trainer, "state", None)
+    best_checkpoint = getattr(trainer_state, "best_model_checkpoint", None)
+    best_metric = getattr(trainer_state, "best_metric", None)
+    log_history = list(getattr(trainer_state, "log_history", None) or [])
+    training_metrics = {
+        "train_loss": train_loss,
+        "eval_loss": best_metric if has_eval else None,
+        "best_checkpoint": Path(best_checkpoint).name if best_checkpoint else None,
+        "resumed_from_checkpoint": resume_checkpoint.name if resume_checkpoint else None,
+        "global_step": int(getattr(trainer_state, "global_step", 0) or 0),
+        "epoch": getattr(trainer_state, "epoch", None),
+        "log_history": log_history[-100:],
+    }
+    (output_dir / "openreef_training_metrics.json").write_text(
+        json.dumps(training_metrics, indent=2, default=str),
+        encoding="utf-8",
+    )
 
     # Save PEFT adapter + tokenizer next to what Axolotl would produce.
     model.save_pretrained(str(output_dir))
@@ -333,6 +410,9 @@ def run_unsloth_sft(
             "max_seq_length": max_seq,
             "num_train_rows": len(texts),
             "train_loss": train_loss,
+            "eval_loss": best_metric if has_eval else None,
+            "best_checkpoint": Path(best_checkpoint).name if best_checkpoint else None,
+            "resumed_from_checkpoint": resume_checkpoint.name if resume_checkpoint else None,
             "dtype": "float16" if device == "amd_rocm" or not bf16 else "bfloat16",
             "smoke": smoke_report,
         },

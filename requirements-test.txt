@@ -1,7 +1,7 @@
 # Minimal deps for worker contract tests (CI unit-tests job).
 # worker.py imports requests/yaml/pydantic at module level; ogpu.service is
 # stubbed by the tests themselves.
-pytest>=8
-requests>=2.31
-PyYAML>=6
-pydantic>=2
+pytest==9.1.1
+requests==2.34.2
+PyYAML==6.0.3
+pydantic==2.13.4

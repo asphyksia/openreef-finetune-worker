@@ -1,0 +1,10 @@
+[Unit]
+Description=Safely update OpenReef provider images while idle
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/openreef/provider-updater.env
+ExecStart=/usr/local/lib/openreef/provider-safe-update.sh --compose-file ${OPENREEF_COMPOSE_FILE} --project-directory ${OPENREEF_PROJECT_DIR}
+SuccessExitStatus=75
