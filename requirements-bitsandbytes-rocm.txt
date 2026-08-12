@@ -1,2 +1,2 @@
 # Must contain libbitsandbytes_rocm72.so; Dockerfile.rocm enforces this.
-bitsandbytes==0.49.2
+bitsandbytes==0.50.0
