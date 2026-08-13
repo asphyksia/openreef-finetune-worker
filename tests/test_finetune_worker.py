@@ -271,6 +271,48 @@ def test_provider_env_accepts_alias(monkeypatch):
     assert worker._verify_expected_device("amd_rocm") == "amd_rocm"
 
 
+def test_main_keeps_service_alive_while_provider_is_paused(
+    monkeypatch, tmp_path, capsys
+):
+    worker = _load_worker(monkeypatch)
+    pause_file = tmp_path / "paused"
+    pause_file.write_text("operator maintenance", encoding="utf-8")
+    monkeypatch.setenv("OPENREEF_PAUSE_FILE", str(pause_file))
+    calls = []
+    monkeypatch.setattr(worker, "clear_training_active", lambda: calls.append("clear"))
+    monkeypatch.setattr(
+        worker,
+        "_install_ogpu_task_address_env_patch",
+        lambda: calls.append("patch"),
+    )
+    monkeypatch.setattr(worker.ogpu.service, "start", lambda: calls.append("start"))
+
+    worker.main()
+
+    assert calls == ["clear", "patch", "start"]
+    assert "PHASE=provider_paused reason=operator maintenance" in capsys.readouterr().err
+
+
+def test_finetune_rejects_paused_provider_before_marking_training_active(
+    monkeypatch, tmp_path
+):
+    worker = _load_worker(monkeypatch)
+    pause_file = tmp_path / "paused"
+    pause_file.write_text("operator maintenance", encoding="utf-8")
+    monkeypatch.setenv("OPENREEF_PAUSE_FILE", str(pause_file))
+    monkeypatch.setattr(worker, "_setup_workspace_file_logging", lambda: None)
+    monkeypatch.setattr(
+        worker,
+        "mark_training_active",
+        lambda *_: pytest.fail("paused provider must not mark training active"),
+    )
+
+    result = worker.finetune(worker.FineTuneInput())
+
+    assert result.status == "failed"
+    assert result.error == "OpenReef provider is paused"
+
+
 def test_package_adapter_output_includes_manifest_and_sha(monkeypatch, tmp_path):
     worker = _load_worker(monkeypatch)
     output_dir = tmp_path / "output"

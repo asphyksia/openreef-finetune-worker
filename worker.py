@@ -2828,7 +2828,7 @@ def _install_ogpu_task_address_env_patch() -> None:
     )
 
 
-if __name__ == "__main__":
+def main() -> None:
     # A recreated worker cannot own an active job from its previous process.
     # Clear only this runtime marker; operator pause/update markers remain authoritative.
     clear_training_active()
@@ -2839,8 +2839,7 @@ if __name__ == "__main__":
             file=sys.stderr,
             flush=True,
         )
-        raise SystemExit(0)
-    if paused_reason:
+    elif paused_reason:
         print(
             f"PHASE=provider_draining reason={paused_reason}",
             file=sys.stderr,
@@ -2848,3 +2847,7 @@ if __name__ == "__main__":
         )
     _install_ogpu_task_address_env_patch()
     ogpu.service.start()
+
+
+if __name__ == "__main__":
+    main()
