@@ -6,7 +6,7 @@ Public OpenReef **provider finetune worker** sources and GHCR image builds.
 |------|--------|
 | Images | `cuda-*` (Unsloth), `rocm-*` (Axolotl), `cuda-multigpu-*` (Axolotl) |
 | Product monorepo | [asphyksia/OpenReef](https://github.com/asphyksia/OpenReef) (private app/deploy) |
-| ADR | OpenReef `docs/worker-repo-split.md` |
+| Product training contract | OpenReef `docs/training.md` |
 
 This repository exists so CUDA/ROCm image builds can use **public Actions** minutes without opening the product monorepo, and so providers can audit the worker that runs on their GPUs.
 
@@ -72,10 +72,11 @@ product image. Multi-GPU is explicit through
 RDNA4 `gfx1200` has a narrow local safety rule: the standard `balanced`
 r32/alpha64 shape is resolved to r64/alpha128 while keeping balanced epochs and
 learning rate. Crossed local evidence showed quality+r32 page-faulting at step
-51 while balanced+r64 completed 502/502. A second r64 pass on the final local
-image also completed 502/502; both adapters passed a three-prompt serve smoke
-with finite loss. This does not waive the consecutive-run gate required before
-publication.
+51 while balanced+r64 completed 502/502. The final local fingerprint completed
+ten consecutive Balanced train + serve runs. Public commit `a99c2d2` then passed
+an exact-image 502/502 smoke with finite loss and no GPU fault; executable digest
+`sha256:462e4d8228f09af462261be7b04b5dbc02a4ba46412b5b8cecbf35206d876177` was
+promoted to `rocm-latest` and pinned on the paused house provider.
 
 ## CI and publication policy
 

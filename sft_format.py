@@ -1,6 +1,6 @@
 """SFT contract v1 — dataset normalize + render + serve-smoke heuristics.
 
-See monorepo docs/sft-contract-v1.md. Internal SoT is always ``messages``;
+See OpenReef docs/training.md. Internal SoT is always ``messages``;
 profile chooses the renderer (chat_template vs fixed completion template).
 """
 

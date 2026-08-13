@@ -368,7 +368,7 @@ class FineTuneInput(BaseModel):
     custom_config: dict | None = None
     # auto | chat | alpaca — how to format SFT prompts (default auto)
     prompt_format: str | None = None
-    # SFT contract v1: chat | completion | experimental (see docs/sft-contract-v1.md)
+    # SFT profiles: chat | completion | experimental (see OpenReef docs/training.md)
     sft_profile: str | None = None
     # Opaque claim (public on IPFS) — resolved via OpenReef claim API
     openreef: dict | None = None
@@ -982,7 +982,7 @@ def _gpu_count() -> int:
 
 
 def _select_train_engine(device: str, preset: str = "balanced") -> str:
-    """Pick train engine (see docs/training-engine.md in monorepo).
+    """Pick train engine (see OpenReef docs/training.md).
 
     Policy (auto) — 2026-08-11:
       - NVIDIA 1 GPU → Unsloth when installed
@@ -1019,7 +1019,7 @@ def _select_train_engine(device: str, preset: str = "balanced") -> str:
         return "axolotl"
 
     # AMD product path: Axolotl. Do not auto-pick Unsloth on ROCm even if installed
-    # (Day-0 / hybrid models have failed with NaN on RDNA4; see training-engine.md).
+    # (Day-0 / hybrid models failed with NaN on RDNA4; see OpenReef docs/training.md).
     if device == "amd_rocm":
         ogpu.service.logger.info(
             "train_engine=auto → axolotl (amd_rocm product default)"
