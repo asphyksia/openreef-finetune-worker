@@ -1,8 +1,9 @@
 name: Build & Push finetune-worker
 
 # Public repo: standard hosted runners (fair use). Still cache aggressively.
-# SAFETY: push/PR build without publishing. Only workflow_dispatch may publish
-# immutable SHA tags; rolling *-latest tags additionally require publish_latest.
+# SAFETY: push/PR build without publishing. workflow_dispatch may publish
+# immutable SHA tags. Rolling *-latest tags are promoted in a separate
+# latest-only dispatch by retagging the exact digest that passed GPU smoke.
 
 on:
   push:
@@ -67,11 +68,23 @@ on:
         type: boolean
         default: false
       publish_latest:
-        description: "Also tag selected *-latest images (only after GPU smoke)"
+        description: "Promote one already-smoked digest to its rolling tag (latest-only)"
         type: boolean
         default: false
+      gpu_smoke_family:
+        description: "Image family whose already-smoked digest will be promoted"
+        type: choice
+        options:
+          - cuda
+          - rocm
+          - cuda-multigpu
+        default: rocm
       gpu_smoke_commit:
         description: "Full commit SHA that passed the real GPU smoke (required for latest)"
+        type: string
+        required: false
+      gpu_smoke_digest:
+        description: "Exact GHCR manifest digest that passed the real GPU smoke (required for latest)"
         type: string
         required: false
 
@@ -96,6 +109,9 @@ jobs:
       cache_to_cuda: ${{ steps.flags.outputs.cache_to_cuda }}
       cache_to_rocm: ${{ steps.flags.outputs.cache_to_rocm }}
       cache_to_cuda_multigpu: ${{ steps.flags.outputs.cache_to_cuda_multigpu }}
+      promote_family: ${{ steps.flags.outputs.promote_family }}
+      smoke_digest: ${{ steps.flags.outputs.smoke_digest }}
+      smoke_commit: ${{ steps.flags.outputs.smoke_commit }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         if: github.event_name == 'push' || github.event_name == 'pull_request'
@@ -138,16 +154,33 @@ jobs:
           CUDA=false
           ROCM=false
           CUDA_MULTIGPU=false
+          PROMOTE_FAMILY=""
+          SMOKE_DIGEST=""
+          SMOKE_COMMIT=""
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             CUDA="${{ inputs.build_cuda }}"
             ROCM="${{ inputs.build_rocm }}"
             CUDA_MULTIGPU="${{ inputs.build_cuda_multigpu }}"
             PUSH=true
             PUBLISH_LATEST="${{ inputs.publish_latest }}"
-            if [ "$PUBLISH_LATEST" = "true" ] \
-               && [ "${{ inputs.gpu_smoke_commit }}" != "${{ github.sha }}" ]; then
-              echo "publish_latest requires gpu_smoke_commit to equal the dispatched commit ${{ github.sha }}" >&2
-              exit 1
+            PROMOTE_FAMILY="${{ inputs.gpu_smoke_family }}"
+            SMOKE_DIGEST="${{ inputs.gpu_smoke_digest }}"
+            SMOKE_COMMIT="${{ inputs.gpu_smoke_commit }}"
+            if [ "$PUBLISH_LATEST" = "true" ]; then
+              if [ "${{ inputs.build_cuda }}" = "true" ] \
+                 || [ "${{ inputs.build_rocm }}" = "true" ] \
+                 || [ "${{ inputs.build_cuda_multigpu }}" = "true" ]; then
+                echo "publish_latest is latest-only: run the immutable build and GPU smoke first, then dispatch with all build flags false" >&2
+                exit 1
+              fi
+              if ! printf '%s' "$SMOKE_COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
+                echo "publish_latest requires gpu_smoke_commit=<full 40-char commit SHA>" >&2
+                exit 1
+              fi
+              if ! printf '%s' "$SMOKE_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+                echo "publish_latest requires gpu_smoke_digest=sha256:<64 lowercase hex chars>" >&2
+                exit 1
+              fi
             fi
           else
             # Push/PR validate affected images but never publish.
@@ -194,6 +227,9 @@ jobs:
           echo "cuda_multigpu=$CUDA_MULTIGPU" >> "$GITHUB_OUTPUT"
           echo "push=$PUSH" >> "$GITHUB_OUTPUT"
           echo "publish_latest=$PUBLISH_LATEST" >> "$GITHUB_OUTPUT"
+          echo "promote_family=$PROMOTE_FAMILY" >> "$GITHUB_OUTPUT"
+          echo "smoke_digest=$SMOKE_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "smoke_commit=$SMOKE_COMMIT" >> "$GITHUB_OUTPUT"
           echo "plan: cuda=$CUDA rocm=$ROCM cuda_multigpu=$CUDA_MULTIGPU push=$PUSH publish_latest=$PUBLISH_LATEST"
 
   build-cuda:
@@ -239,7 +275,6 @@ jobs:
           tags: |
             type=sha,prefix=cuda-,format=short
             type=sha,prefix=cuda-,format=long
-            type=raw,value=cuda-latest,enable=${{ needs.plan.outputs.publish_latest == 'true' }}
 
       - name: Build CUDA
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
@@ -296,7 +331,6 @@ jobs:
           tags: |
             type=sha,prefix=rocm-,format=short
             type=sha,prefix=rocm-,format=long
-            type=raw,value=rocm-latest,enable=${{ needs.plan.outputs.publish_latest == 'true' }}
 
       - name: Build ROCm
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
@@ -347,7 +381,6 @@ jobs:
           tags: |
             type=sha,prefix=cuda-multigpu-,format=short
             type=sha,prefix=cuda-multigpu-,format=long
-            type=raw,value=cuda-multigpu-latest,enable=${{ needs.plan.outputs.publish_latest == 'true' }}
 
       - name: Build CUDA multi-GPU
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
@@ -363,6 +396,61 @@ jobs:
           cache-to: ${{ needs.plan.outputs.cache_to_cuda_multigpu }}
           provenance: false
           sbom: ${{ needs.plan.outputs.push == 'true' }}
+
+  promote-latest:
+    needs: [plan, unit-tests]
+    if: needs.plan.outputs.publish_latest == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote exact GPU-smoked digest
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          FAMILY: ${{ needs.plan.outputs.promote_family }}
+          DIGEST: ${{ needs.plan.outputs.smoke_digest }}
+          COMMIT: ${{ needs.plan.outputs.smoke_commit }}
+        run: |
+          set -euo pipefail
+          case "$FAMILY" in
+            cuda) TAG="cuda-latest"; VERSION_PREFIX="cuda-" ;;
+            rocm) TAG="rocm-latest"; VERSION_PREFIX="rocm-" ;;
+            cuda-multigpu) TAG="cuda-multigpu-latest"; VERSION_PREFIX="cuda-multigpu-" ;;
+            *) echo "unsupported GPU image family: $FAMILY" >&2; exit 1 ;;
+          esac
+          labels="$(docker buildx imagetools inspect "$IMAGE@$DIGEST" --format '{{json .Image.Config.Labels}}')"
+          revision="$(printf '%s' "$labels" | jq -r '."org.opencontainers.image.revision" // empty')"
+          version="$(printf '%s' "$labels" | jq -r '."org.opencontainers.image.version" // empty')"
+          test "$revision" = "$COMMIT" || {
+            echo "image revision mismatch: expected=$COMMIT actual=$revision" >&2
+            exit 1
+          }
+          case "$version" in
+            "$VERSION_PREFIX"*) ;;
+            *)
+              echo "image family mismatch: expected_prefix=$VERSION_PREFIX actual_version=$version" >&2
+              exit 1
+              ;;
+          esac
+          # A single-source carbon copy preserves the exact source descriptor.
+          # Do not let Buildx synthesize a new index or attach a new attestation.
+          docker buildx imagetools create --prefer-index=false --tag "$IMAGE:$TAG" "$IMAGE@$DIGEST"
+          promoted="$(docker buildx imagetools inspect "$IMAGE:$TAG" | awk '/^Digest:/ {print $2; exit}')"
+          test "$promoted" = "$DIGEST" || {
+            echo "rolling tag digest mismatch: expected=$DIGEST actual=$promoted" >&2
+            exit 1
+          }
+          echo "promoted $IMAGE:$TAG -> $DIGEST"
 
   unit-tests:
     runs-on: ubuntu-latest

@@ -116,6 +116,36 @@ def test_workflow_covers_sources_and_never_pushes_on_main():
     assert "gpu_smoke_commit" in script
 
 
+def test_latest_promotion_retags_only_the_exact_gpu_smoked_digest():
+    text = _read(".github/workflows/docker-images.yml")
+    workflow = yaml.load(text, Loader=yaml.BaseLoader)
+    inputs = workflow["on"]["workflow_dispatch"]["inputs"]
+    plan = workflow["jobs"]["plan"]
+    promotion = workflow["jobs"]["promote-latest"]
+    script = promotion["steps"][-1]["run"]
+
+    assert "gpu_smoke_family" in inputs
+    assert "gpu_smoke_commit" in inputs
+    assert "gpu_smoke_digest" in inputs
+    assert "smoke_commit" in plan["outputs"]
+    assert set(promotion["needs"]) == {"plan", "unit-tests"}
+    assert "publish_latest is latest-only" in text
+    assert "org.opencontainers.image.revision" in script
+    assert "org.opencontainers.image.version" in script
+    assert "imagetools create --prefer-index=false" in script
+    assert 'test "$promoted" = "$DIGEST"' in script
+
+    metadata_blocks = [
+        step["with"]["tags"]
+        for job_name, job in workflow["jobs"].items()
+        if job_name.startswith("build-")
+        for step in job["steps"]
+        if step.get("name", "").startswith("Docker metadata")
+    ]
+    assert metadata_blocks
+    assert all("latest" not in tags for tags in metadata_blocks)
+
+
 def test_actions_are_pinned_and_cuda_lock_is_used():
     workflow = _read(".github/workflows/docker-images.yml")
     assert "actions/checkout@v" not in workflow
