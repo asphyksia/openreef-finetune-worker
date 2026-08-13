@@ -12,6 +12,7 @@ on:
       - "Dockerfile"
       - "Dockerfile.rocm"
       - "Dockerfile.axolotl.cuda"
+      - ".dockerignore"
       - "worker.py"
       - "runtime_probe.py"
       - "training_config.py"
@@ -35,6 +36,7 @@ on:
       - "Dockerfile"
       - "Dockerfile.rocm"
       - "Dockerfile.axolotl.cuda"
+      - ".dockerignore"
       - "worker.py"
       - "runtime_probe.py"
       - "training_config.py"
@@ -135,6 +137,7 @@ jobs:
               - 'Dockerfile.axolotl.cuda'
               - 'requirements-axolotl-cuda.txt'
             shared:
+              - '.dockerignore'
               - 'worker.py'
               - 'runtime_probe.py'
               - 'training_config.py'
