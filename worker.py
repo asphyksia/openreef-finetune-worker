@@ -10,6 +10,7 @@ NVIDIA and AMD providers without modification.
 """
 
 import base64
+import contextvars
 import csv
 import hashlib
 import json
@@ -18,6 +19,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -47,6 +49,14 @@ from pause_guard import (
 _FILE_LOG_CONFIGURED = False
 _PHASE_LOGGER = logging.getLogger("openreef.phase")
 
+# The worker has one shared GPU workspace. Reserve it before accepting a task so
+# independent FastAPI background threads cannot overlap and corrupt each other.
+_JOB_STATE_LOCK = threading.Lock()
+_ACTIVE_TASK_ADDRESS: str | None = None
+_TASK_ADDRESS_CONTEXT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "openreef_task_address", default=None
+)
+
 # Shared pipeline progress for claim heartbeats (Lab % is not time-only).
 _PROGRESS_LOCK = None  # set lazily to avoid import-time threading issues
 _PROGRESS_STATE: dict[str, object] = {
@@ -58,6 +68,44 @@ _PROGRESS_STATE: dict[str, object] = {
     "train_log": None,
     "metrics": None,
 }
+
+
+def _direct_input_allowed() -> bool:
+    """Allow direct model/dataset input only for an explicitly local harness."""
+    return os.environ.get("OPENREEF_ALLOW_DIRECT_INPUT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _try_reserve_job(task_address: str) -> bool:
+    """Atomically reserve the single shared training workspace."""
+    global _ACTIVE_TASK_ADDRESS
+    with _JOB_STATE_LOCK:
+        if _ACTIVE_TASK_ADDRESS is not None:
+            return False
+        _ACTIVE_TASK_ADDRESS = task_address
+        return True
+
+
+def _release_job(task_address: str) -> None:
+    """Release only the reservation owned by this task."""
+    global _ACTIVE_TASK_ADDRESS
+    with _JOB_STATE_LOCK:
+        if _ACTIVE_TASK_ADDRESS == task_address:
+            _ACTIVE_TASK_ADDRESS = None
+
+
+def _current_task_address() -> str | None:
+    """Read request-local task state, with env fallback for local harnesses."""
+    return (
+        _TASK_ADDRESS_CONTEXT.get()
+        or os.environ.get("OGPU_TASK_ADDRESS")
+        or os.environ.get("TASK_ADDRESS")
+        or os.environ.get("OGPU_CURRENT_TASK")
+    )
 
 # Floors mirror backend app.services.job_progress.PHASE_PROGRESS
 _PHASE_PROGRESS_FLOOR: dict[str, int] = {
@@ -164,6 +212,13 @@ def _set_progress(
 def _snapshot_progress() -> dict[str, object]:
     with _progress_lock():
         return dict(_PROGRESS_STATE)
+
+
+def _reset_progress() -> None:
+    """Start each admitted job with an independent heartbeat snapshot."""
+    with _progress_lock():
+        for key in _PROGRESS_STATE:
+            _PROGRESS_STATE[key] = None
 
 
 def _parse_train_steps_from_log(log_path: str | None) -> tuple[int | None, int | None]:
@@ -339,7 +394,8 @@ class FineTuneInput(BaseModel):
 
     Real OpenReef jobs publish an opaque ``openreef`` claim on IPFS. The worker
     exchanges it for short-lived dataset/upload URLs after the task is attempted.
-    Legacy / mock / local modes may still send full fields directly.
+    Local harnesses may send full fields only when the unsafe direct-input
+    escape hatch is explicitly enabled. Public provider images require a claim.
     """
 
     model_config = {"extra": "ignore"}
@@ -915,10 +971,7 @@ def _probe_tokenizer_has_chat_template(base_model: str) -> bool | None:
         or None
     )
     try:
-        kwargs: dict = {
-            "trust_remote_code": True,
-            "use_fast": True,
-        }
+        kwargs: dict = {"trust_remote_code": False, "use_fast": True}
         if token:
             kwargs["token"] = token
         tok = AutoTokenizer.from_pretrained(base_model, **kwargs)
@@ -1370,7 +1423,7 @@ def _run_axolotl_sft_contract(
                 or os.environ.get("HUGGINGFACE_HUB_TOKEN")
                 or None
             )
-            tok_kwargs: dict = {"trust_remote_code": True}
+            tok_kwargs: dict = {"trust_remote_code": False}
             if token:
                 tok_kwargs["token"] = token
             # Prefer adapter dir tokenizer (saved with train) then base.
@@ -1381,7 +1434,7 @@ def _run_axolotl_sft_contract(
 
             dtype = torch.float16 if device == "amd_rocm" else torch.bfloat16
             model_kwargs: dict = {
-                "trust_remote_code": True,
+                "trust_remote_code": False,
                 "torch_dtype": dtype,
                 "device_map": "auto",
             }
@@ -2040,9 +2093,7 @@ def _resolve_openreef_claim(data: FineTuneInput, task_address: str | None = None
     task = (
         (task_address or "").strip()
         or str(claim.get("task_address") or "").strip()
-        or (os.environ.get("OGPU_TASK_ADDRESS") or "").strip()
-        or (os.environ.get("TASK_ADDRESS") or "").strip()
-        or (os.environ.get("OGPU_CURRENT_TASK") or "").strip()
+        or (_current_task_address() or "").strip()
     )
 
     # Preferred path: external signer (PK never in this container).
@@ -2195,13 +2246,13 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
         return output
 
     # Resolve opaque claim before logging model/dataset details.
-    task_address = (
-        os.environ.get("OGPU_TASK_ADDRESS")
-        or os.environ.get("TASK_ADDRESS")
-        or os.environ.get("OGPU_CURRENT_TASK")
-    )
-    mark_training_active(task_address)
+    task_address = _current_task_address()
     has_claim = bool(getattr(data, "openreef", None))
+    if not has_claim and not _direct_input_allowed():
+        _phase("claim_fail", reason="claim_required")
+        return FineTuneOutput(status="failed", error="OpenReef claim required")
+
+    mark_training_active(task_address)
     _phase(
         "job_start",
         task=task_address,
@@ -2232,7 +2283,7 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
             heartbeat = _ClaimantHeartbeat(data)
             heartbeat.start()
         else:
-            _phase("claim_skip", reason="no_openreef_payload")
+            _phase("claim_skip", reason="local_direct_input_enabled")
     except Exception as e:
         # Keep full exception in logs/PHASE; public OGPU response stays minimal.
         _phase("claim_fail", error=str(e)[:240])
@@ -2711,8 +2762,8 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
 
 def _install_ogpu_task_address_env_patch() -> None:
     """OGPU FastAPI exposes /run/{fn}/{task_address} but never passes task_address
-    into the handler — only ``handler(data)``. Inject it into env for the job
-    so D2 claim can sign the correct task (H-02 / claim e2e fix).
+    into the handler -- only ``handler(data)``. Bind it to request-local context
+    so D2 can sign the correct task without mutating process-global environment.
 
     Important: ``ogpu.service.start`` is a *bound import* of ``server.start`` at
     package import time. Patching only ``server.start`` leaves
@@ -2737,7 +2788,7 @@ def _install_ogpu_task_address_env_patch() -> None:
         from ogpu.service.logger import logger
         from ogpu.service.server import send_callback
 
-        logger.info("Starting OpenGPU Service server (OpenReef task_address env patch)...")
+        logger.info("Starting OpenGPU Service server (OpenReef task context patch)...")
 
         @asynccontextmanager
         async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -2771,16 +2822,27 @@ def _install_ogpu_task_address_env_patch() -> None:
                         status_code=503,
                         detail="OpenReef provider is paused by its operator",
                     )
+                if function_name == "finetune":
+                    has_claim = bool(getattr(data, "openreef", None))
+                    if not has_claim and not _direct_input_allowed():
+                        _phase("claim_fail", reason="claim_required")
+                        raise HTTPException(
+                            status_code=403,
+                            detail="OpenReef claim required",
+                        )
+                if not _try_reserve_job(task_address):
+                    _phase("provider_busy", task=task_address)
+                    raise HTTPException(
+                        status_code=409,
+                        detail="OpenReef provider is already training",
+                    )
+                _reset_progress()
 
                 def runner():
-                    prev_ogpu = os.environ.get("OGPU_TASK_ADDRESS")
-                    prev_task = os.environ.get("TASK_ADDRESS")
+                    token = _TASK_ADDRESS_CONTEXT.set(task_address)
                     try:
-                        # Visible to finetune() / claim without changing handler signature.
-                        os.environ["OGPU_TASK_ADDRESS"] = task_address
-                        os.environ["TASK_ADDRESS"] = task_address
                         _phase(
-                            "task_env_set",
+                            "task_context_set",
                             task=task_address[:14] + "…"
                             if len(task_address) > 14
                             else task_address,
@@ -2796,16 +2858,15 @@ def _install_ogpu_task_address_env_patch() -> None:
                             f"[{task_address}] Error in `{function_name}`: {e}"
                         )
                     finally:
-                        if prev_ogpu is None:
-                            os.environ.pop("OGPU_TASK_ADDRESS", None)
-                        else:
-                            os.environ["OGPU_TASK_ADDRESS"] = prev_ogpu
-                        if prev_task is None:
-                            os.environ.pop("TASK_ADDRESS", None)
-                        else:
-                            os.environ["TASK_ADDRESS"] = prev_task
+                        clear_training_active()
+                        _TASK_ADDRESS_CONTEXT.reset(token)
+                        _release_job(task_address)
 
-                background_tasks.add_task(runner)
+                try:
+                    background_tasks.add_task(runner)
+                except Exception:
+                    _release_job(task_address)
+                    raise
                 return {"task_address": task_address, "status": "accepted"}
 
             return endpoint
@@ -2824,7 +2885,7 @@ def _install_ogpu_task_address_env_patch() -> None:
     svc_mod.start = start_patched  # type: ignore[assignment]
     server_mod._openreef_task_env_patched = True  # type: ignore[attr-defined]
     svc_mod.logger.info(
-        "OpenReef: patched OGPU server + ogpu.service.start to inject OGPU_TASK_ADDRESS"
+        "OpenReef: patched OGPU server with task context and admission lock"
     )
 
 
@@ -2832,6 +2893,7 @@ def main() -> None:
     # A recreated worker cannot own an active job from its previous process.
     # Clear only this runtime marker; operator pause/update markers remain authoritative.
     clear_training_active()
+    _reset_progress()
     paused_reason = provider_pause_reason()
     if paused_reason and pause_file_path().is_file():
         print(

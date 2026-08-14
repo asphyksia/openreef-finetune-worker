@@ -150,4 +150,11 @@ source tree is AGPL-3.0; OpenReef does not copy or import Studio/CLI code.
 
 - Never commit `.env`, private keys, or tokens.
 - `PROVIDER_PRIVATE_KEY` belongs in the **signer** sidecar (or provider-app env), not in this image.
+- Public finetune requests require an OpenReef claim; direct model/dataset fields
+  are rejected before a job is accepted.
+- The worker admits one GPU job at a time because progress and workspace state
+  are process-wide.
+- Hugging Face remote model code is disabled in tokenizer, train and serve paths.
+- `OPENREEF_ALLOW_DIRECT_INPUT=1` exists only for isolated local harnesses. Never
+  set it in provider Compose files or published image defaults.
 - Report security issues privately to the OpenReef operators.

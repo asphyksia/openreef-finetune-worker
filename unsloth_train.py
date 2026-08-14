@@ -173,6 +173,7 @@ def run_unsloth_sft(
         max_seq_length=max_seq,
         dtype=_torch.float16 if device == "amd_rocm" else None,
         load_in_4bit=load_in_4bit,
+        trust_remote_code=False,
     )
     model = FastLanguageModel.get_peft_model(
         model,

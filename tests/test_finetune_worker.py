@@ -280,6 +280,7 @@ def test_main_keeps_service_alive_while_provider_is_paused(
     monkeypatch.setenv("OPENREEF_PAUSE_FILE", str(pause_file))
     calls = []
     monkeypatch.setattr(worker, "clear_training_active", lambda: calls.append("clear"))
+    monkeypatch.setattr(worker, "_reset_progress", lambda: calls.append("reset"))
     monkeypatch.setattr(
         worker,
         "_install_ogpu_task_address_env_patch",
@@ -289,7 +290,7 @@ def test_main_keeps_service_alive_while_provider_is_paused(
 
     worker.main()
 
-    assert calls == ["clear", "patch", "start"]
+    assert calls == ["clear", "reset", "patch", "start"]
     assert "PHASE=provider_paused reason=operator maintenance" in capsys.readouterr().err
 
 
@@ -311,6 +312,76 @@ def test_finetune_rejects_paused_provider_before_marking_training_active(
 
     assert result.status == "failed"
     assert result.error == "OpenReef provider is paused"
+
+
+def test_direct_input_is_rejected_without_explicit_local_escape_hatch(monkeypatch):
+    worker = _load_worker(monkeypatch)
+    monkeypatch.delenv("OPENREEF_ALLOW_DIRECT_INPUT", raising=False)
+    monkeypatch.setattr(worker, "_setup_workspace_file_logging", lambda: None)
+    monkeypatch.setattr(
+        worker,
+        "mark_training_active",
+        lambda *_: pytest.fail("unclaimed input must fail before marking active"),
+    )
+
+    result = worker.finetune(
+        worker.FineTuneInput(
+            base_model="attacker/model",
+            dataset_url="https://example.com/dataset.jsonl",
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error == "OpenReef claim required"
+
+
+def test_direct_input_escape_hatch_is_explicit(monkeypatch):
+    worker = _load_worker(monkeypatch)
+    monkeypatch.delenv("OPENREEF_ALLOW_DIRECT_INPUT", raising=False)
+    assert worker._direct_input_allowed() is False
+
+    monkeypatch.setenv("OPENREEF_ALLOW_DIRECT_INPUT", "true")
+    assert worker._direct_input_allowed() is True
+
+
+def test_single_job_reservation_is_owner_safe(monkeypatch):
+    worker = _load_worker(monkeypatch)
+
+    assert worker._try_reserve_job("task-one") is True
+    assert worker._try_reserve_job("task-two") is False
+
+    worker._release_job("task-two")
+    assert worker._try_reserve_job("task-three") is False
+
+    worker._release_job("task-one")
+    assert worker._try_reserve_job("task-three") is True
+    worker._release_job("task-three")
+
+
+def test_tokenizer_probe_disables_remote_code(monkeypatch):
+    worker = _load_worker(monkeypatch)
+    calls = []
+
+    class Tokenizer:
+        chat_template = "{{ messages }}"
+
+    class AutoTokenizer:
+        @staticmethod
+        def from_pretrained(model, **kwargs):
+            calls.append((model, kwargs))
+            return Tokenizer()
+
+    transformers = types.ModuleType("transformers")
+    transformers.AutoTokenizer = AutoTokenizer
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    assert worker._probe_tokenizer_has_chat_template("trusted/model") is True
+    assert calls == [
+        (
+            "trusted/model",
+            {"trust_remote_code": False, "use_fast": True},
+        )
+    ]
 
 
 def test_package_adapter_output_includes_manifest_and_sha(monkeypatch, tmp_path):

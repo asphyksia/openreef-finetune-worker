@@ -459,6 +459,7 @@ def build_axolotl_config_dict(
     config: dict[str, Any] = {
         "base_model": base_model,
         "base_model_config": base_model,
+        "trust_remote_code": False,
         "model_type": "AutoModelForCausalLM",
         "tokenizer_type": "AutoTokenizer",
         "datasets": datasets,
