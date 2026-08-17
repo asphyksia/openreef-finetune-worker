@@ -43,6 +43,7 @@ from pause_guard import (
     pause_file_path,
     provider_pause_reason,
 )
+from workspace_hygiene import sanitize_for_next_job, workspace_dir
 
 # Host-visible logs: provider-app bind-mounts host data dir → /data → /workspace.
 # Windows/Linux providers can open these files even when `docker logs` is empty.
@@ -98,6 +99,45 @@ def _release_job(task_address: str) -> None:
             _ACTIVE_TASK_ADDRESS = None
 
 
+def _admit_job(task_address: str) -> str | None:
+    """Reserve the node only after leftover dataset/GPU state is gone.
+
+    Returns None when admitted, ``busy`` if another task holds the lock, or
+    ``dirty`` when purge+verify failed and the node must stay closed.
+    """
+    report = sanitize_for_next_job(workspace_dir())
+    if not report.get("ok"):
+        leftovers = (report.get("workspace") or {}).get("leftovers") or []
+        gpu = report.get("gpu") or {}
+        _phase(
+            "workspace_dirty",
+            leftovers=",".join(leftovers)[:200],
+            allocated_mb=round(int(gpu.get("allocated_bytes") or 0) / (1024 * 1024), 2),
+        )
+        return "dirty"
+    if not _try_reserve_job(task_address):
+        return "busy"
+    return None
+
+
+def _release_job_if_clean(task_address: str) -> bool:
+    """Purge job leftovers and release only when the checker passes."""
+    report = sanitize_for_next_job(workspace_dir())
+    if report.get("ok"):
+        leftovers = (report.get("workspace") or {}).get("removed") or []
+        _phase("workspace_purged", removed=",".join(leftovers)[:200])
+        _release_job(task_address)
+        return True
+    leftovers = (report.get("workspace") or {}).get("leftovers") or []
+    gpu = report.get("gpu") or {}
+    _phase(
+        "workspace_dirty",
+        leftovers=",".join(leftovers)[:200],
+        allocated_mb=round(int(gpu.get("allocated_bytes") or 0) / (1024 * 1024), 2),
+    )
+    return False
+
+
 def _current_task_address() -> str | None:
     """Read request-local task state, with env fallback for local harnesses."""
     return (
@@ -130,6 +170,7 @@ _PHASE_PROGRESS_FLOOR: dict[str, int] = {
     "upload_start": 95,
     "upload_ok": 97,
     "job_done": 98,
+    "workspace_purged": 99,
 }
 
 _PHASE_LABELS: dict[str, str] = {
@@ -147,6 +188,8 @@ _PHASE_LABELS: dict[str, str] = {
     "upload_start": "Uploading adapter…",
     "upload_ok": "Upload complete",
     "job_done": "Job finishing…",
+    "workspace_purged": "Workspace cleared for the next job",
+    "workspace_dirty": "Workspace still holds job leftovers",
 }
 
 
@@ -2830,11 +2873,17 @@ def _install_ogpu_task_address_env_patch() -> None:
                             status_code=403,
                             detail="OpenReef claim required",
                         )
-                if not _try_reserve_job(task_address):
+                admit = _admit_job(task_address)
+                if admit == "busy":
                     _phase("provider_busy", task=task_address)
                     raise HTTPException(
                         status_code=409,
                         detail="OpenReef provider is already training",
+                    )
+                if admit == "dirty":
+                    raise HTTPException(
+                        status_code=503,
+                        detail="OpenReef provider is not clean for the next job",
                     )
                 _reset_progress()
 
@@ -2860,12 +2909,12 @@ def _install_ogpu_task_address_env_patch() -> None:
                     finally:
                         clear_training_active()
                         _TASK_ADDRESS_CONTEXT.reset(token)
-                        _release_job(task_address)
+                        _release_job_if_clean(task_address)
 
                 try:
                     background_tasks.add_task(runner)
                 except Exception:
-                    _release_job(task_address)
+                    _release_job_if_clean(task_address)
                     raise
                 return {"task_address": task_address, "status": "accepted"}
 

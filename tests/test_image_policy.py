@@ -26,6 +26,7 @@ def test_engine_images_match_product_policy():
 
     for dockerfile in (cuda, rocm, cuda_multigpu):
         assert "sft_format.py" in dockerfile
+        assert "workspace_hygiene.py" in dockerfile
         assert "worker.py" in dockerfile
         assert "OPENREEF_THIRD_PARTY_NOTICES.md" in dockerfile
         assert "write_dependency_inventory.py" in dockerfile

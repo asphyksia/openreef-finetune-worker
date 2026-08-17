@@ -69,7 +69,7 @@ PY
 # the entrypoint.
 WORKDIR /workspace
 
-COPY worker.py runtime_probe.py training_config.py display_gpu_guard.py platform_compat.py pause_guard.py sft_format.py /app/
+COPY worker.py runtime_probe.py training_config.py display_gpu_guard.py platform_compat.py pause_guard.py workspace_hygiene.py sft_format.py /app/
 ENV PYTHONPATH=/app
 
 ENTRYPOINT ["python", "/app/worker.py"]

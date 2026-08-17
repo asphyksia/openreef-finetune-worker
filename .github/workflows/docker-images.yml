@@ -19,6 +19,7 @@ on:
       - "display_gpu_guard.py"
       - "platform_compat.py"
       - "pause_guard.py"
+      - "workspace_hygiene.py"
       - "unsloth_train.py"
       - "sft_format.py"
       - "scripts/**"
@@ -43,6 +44,7 @@ on:
       - "display_gpu_guard.py"
       - "platform_compat.py"
       - "pause_guard.py"
+      - "workspace_hygiene.py"
       - "unsloth_train.py"
       - "sft_format.py"
       - "scripts/**"
@@ -144,6 +146,7 @@ jobs:
               - 'display_gpu_guard.py'
               - 'platform_compat.py'
               - 'pause_guard.py'
+              - 'workspace_hygiene.py'
               - 'sft_format.py'
             workflow:
               - '.github/workflows/docker-images.yml'

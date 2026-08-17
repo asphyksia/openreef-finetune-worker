@@ -201,7 +201,7 @@ PY
 # the entrypoint (a previous bug wiped /workspace/worker.py at runtime).
 WORKDIR /workspace
 
-COPY worker.py runtime_probe.py training_config.py display_gpu_guard.py platform_compat.py pause_guard.py unsloth_train.py sft_format.py /app/
+COPY worker.py runtime_probe.py training_config.py display_gpu_guard.py platform_compat.py pause_guard.py workspace_hygiene.py unsloth_train.py sft_format.py /app/
 COPY scripts/ /app/scripts/
 # Defaults safe on Linux + Windows/WSL2 Docker Desktop. Worker may reinforce via
 # platform_compat autodetection (OPENREEF_FORCE_EAGER_TORCH=0 to opt out).

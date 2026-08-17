@@ -72,7 +72,7 @@ PY
 
 WORKDIR /workspace
 
-COPY worker.py runtime_probe.py training_config.py display_gpu_guard.py platform_compat.py pause_guard.py sft_format.py /app/
+COPY worker.py runtime_probe.py training_config.py display_gpu_guard.py platform_compat.py pause_guard.py workspace_hygiene.py sft_format.py /app/
 ENV PYTHONPATH=/app \
     TORCH_DISABLE_NATIVE_JIT=1 \
     TORCHDYNAMO_DISABLE=1 \
