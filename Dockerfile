@@ -12,7 +12,7 @@
 # runs with GPU access (see scripts/smoke_unsloth_rocm.py pattern / Vast).
 # Merge gate for pin bumps also requires a 1-step GPU mini-train (house/Vast).
 
-FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
+FROM nvidia/cuda:13.3.1-cudnn-runtime-ubuntu22.04
 
 # --- complete lock (override from pins-cuda.env) ---
 ARG TORCH_VERSION=2.9.1
