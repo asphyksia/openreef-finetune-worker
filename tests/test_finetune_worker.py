@@ -169,6 +169,32 @@ def test_custom_hyperparameters_are_resolved_without_floating_fields():
         resolve_training_hyperparams("custom", custom_config={"unknown": 1})
 
 
+def test_save_steps_clamp_to_estimated_job_length():
+    from training_config import clamp_schedule_steps, estimate_train_steps, resolve_training_hyperparams
+
+    assert estimate_train_steps(
+        num_dataset_rows=36,
+        num_epochs=2,
+        micro_batch_size=2,
+        gradient_accumulation_steps=2,
+        val_set_size=0.05,
+    ) == 18
+    assert clamp_schedule_steps(100, 18) == 18
+    assert clamp_schedule_steps(20, 200) == 20
+    assert clamp_schedule_steps(100, None) == 100
+
+    short = resolve_training_hyperparams(
+        "balanced", param_count=3, num_dataset_rows=36
+    )
+    assert short["save_steps"] == 18
+    assert short["logging_steps"] <= 18
+
+    long = resolve_training_hyperparams(
+        "balanced", param_count=3, num_dataset_rows=4000
+    )
+    assert long["save_steps"] == 100
+
+
 def test_axolotl_train_command_single_and_multi_gpu(monkeypatch):
     worker = _load_worker(monkeypatch)
 

@@ -170,6 +170,38 @@ def should_enable_sample_packing(
     return True
 
 
+def estimate_train_steps(
+    *,
+    num_dataset_rows: int | None,
+    num_epochs: int,
+    micro_batch_size: int,
+    gradient_accumulation_steps: int,
+    val_set_size: float = 0.0,
+) -> int | None:
+    """Best-effort trainer step count. None when the row count is unknown."""
+    if num_dataset_rows is None:
+        return None
+    rows = max(0, int(num_dataset_rows))
+    train_rows = rows
+    val = float(val_set_size or 0.0)
+    # Unsloth/Axolotl only split when there are enough rows for a val set.
+    if val > 0.0 and rows >= 32:
+        train_rows = max(1, int(rows * (1.0 - val)))
+    if train_rows <= 0:
+        return None
+    per_step = max(1, int(micro_batch_size) * int(gradient_accumulation_steps))
+    steps_per_epoch = max(1, (train_rows + per_step - 1) // per_step)
+    return max(1, steps_per_epoch * max(1, int(num_epochs)))
+
+
+def clamp_schedule_steps(configured: int, est_max_steps: int | None) -> int:
+    """Keep save/eval/logging on a schedule that can actually fire."""
+    configured = max(1, int(configured))
+    if not est_max_steps:
+        return configured
+    return min(configured, max(1, int(est_max_steps)))
+
+
 def resolve_training_hyperparams(
     preset: str,
     *,
@@ -220,9 +252,19 @@ def resolve_training_hyperparams(
         vram_gb=vram_gb,
         param_count=param_count,
     )
+    num_epochs = int(base["num_epochs"])
+    est_steps = estimate_train_steps(
+        num_dataset_rows=num_dataset_rows,
+        num_epochs=num_epochs,
+        micro_batch_size=micro_batch,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        val_set_size=float(base["val_set_size"]),
+    )
+    save_steps = clamp_schedule_steps(int(base.get("save_steps", 100)), est_steps)
+    logging_steps = clamp_schedule_steps(int(base.get("logging_steps", 10)), est_steps)
 
     return {
-        "num_epochs": int(base["num_epochs"]),
+        "num_epochs": num_epochs,
         "learning_rate": float(base["learning_rate"]),
         "batch_size": micro_batch,
         "micro_batch_size": micro_batch,
@@ -238,8 +280,8 @@ def resolve_training_hyperparams(
         "gradient_checkpointing": needs_gc,
         "weight_decay": float(base.get("weight_decay", 0.0)),
         "max_grad_norm": float(base.get("max_grad_norm", 1.0)),
-        "logging_steps": 10,
-        "save_steps": int(base.get("save_steps", 100)),
+        "logging_steps": logging_steps,
+        "save_steps": save_steps,
         "save_total_limit": int(base.get("save_total_limit", 1)),
         "train_on_inputs": False,
         "param_count": int(param_count or 0),

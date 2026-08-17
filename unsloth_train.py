@@ -112,7 +112,11 @@ def run_unsloth_sft(
 
     Returns ``output_dir`` on success. Raises on failure.
     """
-    from training_config import resolve_training_hyperparams
+    from training_config import (
+        clamp_schedule_steps,
+        estimate_train_steps,
+        resolve_training_hyperparams,
+    )
 
     def _phase(name: str, **fields: object) -> None:
         if phase is not None:
@@ -238,7 +242,15 @@ def run_unsloth_sft(
 
     trainer_state_dir = Path(checkpoint_dir or (output_dir / "trainer_state"))
     trainer_state_dir.mkdir(parents=True, exist_ok=True)
-    save_steps = max(1, int(hp.get("save_steps") or 100))
+    est_steps = estimate_train_steps(
+        num_dataset_rows=len(train_ds),
+        num_epochs=epochs,
+        micro_batch_size=micro,
+        gradient_accumulation_steps=grad_accum,
+        val_set_size=0.0,
+    )
+    save_steps = clamp_schedule_steps(int(hp.get("save_steps") or 100), est_steps)
+    logging_steps = clamp_schedule_steps(int(hp.get("logging_steps") or 10), est_steps)
     has_eval = eval_ds is not None
 
     # Prefer SFTConfig (TRL >=0.22): dataset_* / packing live on the config object.
@@ -250,7 +262,7 @@ def run_unsloth_sft(
         learning_rate=lr,
         fp16=not bf16,
         bf16=bf16,
-        logging_steps=max(1, int(hp.get("logging_steps") or 10)),
+        logging_steps=logging_steps,
         optim=(
             str(hp.get("optimizer") or "adamw_8bit")
             if device == "nvidia_cuda"
