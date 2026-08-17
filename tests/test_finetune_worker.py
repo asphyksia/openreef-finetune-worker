@@ -155,6 +155,15 @@ def test_custom_hyperparameters_are_resolved_without_floating_fields():
     assert resolved["weight_decay"] == pytest.approx(0.03)
     assert resolved["save_steps"] == 20
     assert resolved["save_total_limit"] == 2
+    assert resolved["lora_dropout"] == 0.0
+    assert resolve_training_hyperparams("fast")["lora_dropout"] == 0.0
+    assert resolve_training_hyperparams("balanced")["lora_dropout"] == 0.0
+    assert (
+        resolve_training_hyperparams(
+            "custom", custom_config={**custom, "lora_dropout": 0.05}
+        )["lora_dropout"]
+        == 0.05
+    )
 
     with pytest.raises(ValueError, match="Unsupported Custom fields"):
         resolve_training_hyperparams("custom", custom_config={"unknown": 1})

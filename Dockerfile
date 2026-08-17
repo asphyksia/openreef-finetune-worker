@@ -40,11 +40,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PATH="/opt/venv/bin:$PATH"
 
+# python3.10-dev + build-essential: Unsloth/Triton compile cuda_utils.c on
+# the first train step. A runtime-only image dies with "no C compiler" /
+# missing Python.h. ~250 MB; required for out-of-the-box CUDA Fast.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 \
     python3.10-venv \
+    python3.10-dev \
     python3-pip \
     git \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements-build.txt requirements-worker-io.txt /tmp/

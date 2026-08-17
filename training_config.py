@@ -65,6 +65,7 @@ PRESET_PARAMS: dict[str, dict[str, Any]] = {
         "base_batch_size": 2,
         "lora_r": 16,
         "lora_alpha": 32,
+        "lora_dropout": 0.0,
         "val_set_size": 0.0,
     },
     "balanced": {
@@ -73,6 +74,7 @@ PRESET_PARAMS: dict[str, dict[str, Any]] = {
         "base_batch_size": 2,
         "lora_r": 32,
         "lora_alpha": 64,
+        "lora_dropout": 0.0,
         "val_set_size": 0.05,
     },
 }
@@ -227,7 +229,7 @@ def resolve_training_hyperparams(
         "base_batch_size": int(base["base_batch_size"]),
         "lora_r": int(base["lora_r"]),
         "lora_alpha": int(base["lora_alpha"]),
-        "lora_dropout": float(base.get("lora_dropout", 0.05)),
+        "lora_dropout": float(base.get("lora_dropout", 0.0)),
         "sequence_len": sequence_len,
         "sample_packing": sample_packing,
         "val_set_size": float(base["val_set_size"]),

@@ -17,6 +17,8 @@ def test_engine_images_match_product_policy():
     cuda_multigpu = _read("Dockerfile.axolotl.cuda")
 
     assert "unsloth==${UNSLOTH_VERSION}" in cuda
+    assert "python3.10-dev" in cuda
+    assert "build-essential" in cuda
     assert "requirements-axolotl-rocm.txt" in rocm
     assert "unsloth[amd]" not in rocm
     assert "requirements-axolotl-cuda.txt" in cuda_multigpu
