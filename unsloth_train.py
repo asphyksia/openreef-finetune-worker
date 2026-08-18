@@ -8,6 +8,7 @@ adamw_torch instead of the bnb-backed adamw_8bit. Exports a standard PEFT adapte
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -55,6 +56,11 @@ def lora_target_modules_for_model(base_model: str) -> list[str]:
     if "lfm" in name or "liquid" in name:
         return list(_LFM_LORA_TARGETS)
     return list(_DEFAULT_LORA_TARGETS)
+
+
+def _hash_messages(messages: list[dict[str, Any]]) -> str:
+    payload = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _load_jsonl_rows(path: Path) -> list[dict[str, Any]]:
@@ -107,6 +113,7 @@ def run_unsloth_sft(
     serve_smoke: bool = True,
     custom_config: dict[str, Any] | None = None,
     checkpoint_dir: Path | None = None,
+    holdout_hashes: list[str] | None = None,
 ) -> Path:
     """Train with Unsloth and write PEFT adapter files under ``output_dir``.
 
@@ -196,14 +203,23 @@ def run_unsloth_sft(
 
     profile = (sft_profile or "chat").strip().lower()
     rows = _load_jsonl_rows(Path(dataset_path))
-    texts: list[str] = []
+    holdout = {h for h in (holdout_hashes or []) if h}
+    train_texts: list[str] = []
+    eval_texts: list[str] = []
+    eval_rows: list[dict[str, Any]] = []
     renderer_ids: list[str] = []
     for row in rows:
         text, rid = _example_to_text(row, tokenizer, sft_profile=profile)
-        if text and text.strip():
-            texts.append(text)
-            renderer_ids.append(rid)
-    if not texts:
+        if not (text and text.strip()):
+            continue
+        renderer_ids.append(rid)
+        digest = _hash_messages(row.get("messages") or [])
+        if holdout and digest in holdout:
+            eval_texts.append(text)
+            eval_rows.append(row)
+        else:
+            train_texts.append(text)
+    if not train_texts:
         raise RuntimeError("No train strings after formatting dataset")
     # Dominant renderer (should be uniform; mixed → experimental inconsistency)
     from collections import Counter
@@ -215,23 +231,28 @@ def run_unsloth_sft(
             "smoke/eval must use the same renderer",
             renderer,
         )
-    train_ds = Dataset.from_dict({"text": texts})
+
+    train_ds = Dataset.from_dict({"text": train_texts})
     _phase(
         "unsloth_dataset_ok",
-        rows=len(texts),
+        rows=len(train_texts),
         max_seq=max_seq,
         sft_profile=profile,
         renderer=renderer,
         has_chat_template=bool(getattr(tokenizer, "chat_template", None)),
+        holdout_rows=len(eval_texts),
     )
 
-    # val split only when enough rows (mirror Axolotl val_set_size gates)
+    # Lab-pinned holdout wins. Otherwise val split when the preset asks for it.
     eval_ds = None
-    val_frac = float(hp.get("val_set_size") or 0)
-    if val_frac > 0 and len(texts) >= 32:
-        split = train_ds.train_test_split(test_size=val_frac, seed=seed)
-        train_ds = split["train"]
-        eval_ds = split["test"]
+    if eval_texts:
+        eval_ds = Dataset.from_dict({"text": eval_texts})
+    else:
+        val_frac = float(hp.get("val_set_size") or 0)
+        if val_frac > 0 and len(train_texts) >= 32:
+            split = train_ds.train_test_split(test_size=val_frac, seed=seed)
+            train_ds = split["train"]
+            eval_ds = split["test"]
 
     # bf16 disabled on AMD: see rocm-libraries#7992 (RDNA4 Tensile page fault).
     bf16 = is_bfloat16_supported() and device != "amd_rocm"
@@ -393,7 +414,7 @@ def run_unsloth_sft(
         smoke_report = _run_serve_smoke(
             model=model,
             tokenizer=tokenizer,
-            rows=rows,
+            rows=eval_rows or rows,
             renderer=renderer,
             phase=_phase,
         )

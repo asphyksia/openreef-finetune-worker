@@ -471,6 +471,8 @@ class FineTuneInput(BaseModel):
     sft_profile: str | None = None
     # Opaque claim (public on IPFS) — resolved via OpenReef claim API
     openreef: dict | None = None
+    holdout_url: str | None = None
+    holdout_sha256: str | None = None
 
     @classmethod
     def model_validate(cls, obj, *args, **kwargs):  # type: ignore[override]
@@ -914,6 +916,27 @@ def _count_jsonl_rows(path: Path) -> int:
             if line.strip():
                 n += 1
     return n
+
+
+def _load_holdout_hashes(data: FineTuneInput) -> list[str] | None:
+    url = (data.holdout_url or "").strip()
+    expected = (data.holdout_sha256 or "").strip().lower()
+    if not url:
+        return None
+    if not expected:
+        raise RuntimeError("holdout_url provided without holdout_sha256")
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    digest = hashlib.sha256(response.content).hexdigest()
+    if digest != expected:
+        raise RuntimeError(
+            f"holdout sidecar sha256 mismatch: expected {expected} got {digest}"
+        )
+    payload = response.json()
+    hashes = payload.get("hashes") if isinstance(payload, dict) else None
+    if not isinstance(hashes, list) or not hashes:
+        raise RuntimeError("holdout sidecar has no hashes")
+    return [str(item) for item in hashes if item]
 
 
 def _detect_vram_gb() -> float | None:
@@ -2492,6 +2515,7 @@ def finetune(data: FineTuneInput) -> FineTuneOutput:
                     not in ("0", "false", "no"),
                     custom_config=data.custom_config,
                     checkpoint_dir=checkpoint_dir,
+                    holdout_hashes=_load_holdout_hashes(data),
                 )
                 train_s = round(time.monotonic() - train_t0, 1)
                 _phase("train_exit", code=0, seconds=train_s, engine="unsloth")
